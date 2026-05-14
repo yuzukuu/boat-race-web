@@ -319,11 +319,13 @@ def dashboard(request):
     for rc in all_races:
         if rc["hit"] not in ("HIT", "MISS"):
             continue
+        # 払戻金が取得できていないレースはシミュレーション対象外
+        if rc["hit"] == "HIT" and not rc.get("payout"):
+            continue
         label = f"{rc['stadium']}R{rc['rno']}"
         total_invested += BET
         if rc["hit"] == "HIT":
-            payout = rc.get("payout") or 350  # 取得できなければ3.5倍をデフォルト
-            gain = payout * (BET // 100) - BET
+            gain = rc["payout"] * (BET // 100) - BET
         else:
             gain = -BET
         sim_balance += gain
@@ -348,9 +350,9 @@ def dashboard(request):
         bet_html = ""
         if rc["hit"]=="HIT":
             hit_html = '<span class="badge hit">🎯 的中!</span>'
-            payout = rc.get("payout") or 350
-            gain = payout * (BET // 100) - BET
-            bet_html = f'<span class="bet-gain">+{gain:,}円</span>'
+            if rc.get("payout"):
+                gain = rc["payout"] * (BET // 100) - BET
+                bet_html = f'<span class="bet-gain">+{gain:,}円</span>'
         elif rc["hit"]=="MISS":
             hit_html = '<span class="badge miss">✗ 不的中</span>'
             bet_html = f'<span class="bet-loss">-{BET:,}円</span>'
