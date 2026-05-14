@@ -166,10 +166,85 @@ def get_race_result(jcd, hd, rno):
                 boat_num = tds[1].get_text(strip=True)
                 name = tds[2].get_text(strip=True)
                 results.append({"rank": rank, "boat": boat_num, "name": name})
+        # 単勝払戻金をサイドエフェクトとしてキャッシュ
+        payout_key = f"payout_{jcd}_{hd}_{rno}"
+        if results and _cache_get(payout_key) is None:
+            payout = _extract_tansho_payout(soup)
+            if payout:
+                _cache_set(payout_key, payout)
         _cache_set(cache_key, results)
         return results
     except:
         return []
+
+def _extract_tansho_payout(soup):
+    """結果ページのHTMLから単勝払戻金（円/100円）を抽出する"""
+    try:
+        for row in soup.select("tr"):
+            cells = row.select("td,th")
+            texts = [c.get_text(strip=True) for c in cells]
+            if any("単勝" in t for t in texts):
+                for text in texts:
+                    nums = re.findall(r'[\d,]+', text)
+                    for n in nums:
+                        val = int(n.replace(',', ''))
+                        if 100 <= val <= 99900:
+                            return val
+    except:
+        pass
+    return None
+
+def _make_balance_chart(history):
+    """収支推移SVGチャートを生成する。history: [(label, balance, gain), ...]"""
+    if not history:
+        return '<p style="color:#999;text-align:center;padding:20px">結果が出たレースがありません</p>'
+    W, H, PAD_L, PAD_R, PAD_T, PAD_B = 700, 220, 55, 20, 20, 40
+    iW = W - PAD_L - PAD_R
+    iH = H - PAD_T - PAD_B
+    balances = [0] + [b for _, b, _ in history]
+    labels = ["開始"] + [l for l, _, _ in history]
+    min_b = min(min(balances), 0)
+    max_b = max(max(balances), 0)
+    rng = max_b - min_b or 1
+
+    def px(i): return PAD_L + iW * i / (len(balances) - 1) if len(balances) > 1 else PAD_L
+    def py(b): return PAD_T + iH * (1 - (b - min_b) / rng)
+
+    y0 = py(0)
+    final = balances[-1]
+    line_color = "#38a169" if final >= 0 else "#e53e3e"
+    fill_color = "#c6f6d5" if final >= 0 else "#fed7d7"
+
+    pts = " ".join(f"{px(i):.1f},{py(b):.1f}" for i, b in enumerate(balances))
+    fill_pts = f"{px(0):.1f},{y0:.1f} {pts} {px(len(balances)-1):.1f},{y0:.1f}"
+
+    svg = f'<svg viewBox="0 0 {W} {H}" style="width:100%;min-width:400px;height:{H}px">'
+    # グリッド・ゼロライン
+    svg += f'<line x1="{PAD_L}" y1="{y0:.1f}" x2="{W-PAD_R}" y2="{y0:.1f}" stroke="#a0aec0" stroke-width="1.5" stroke-dasharray="5,3"/>'
+    for bv in [min_b, max_b]:
+        if bv == 0: continue
+        yv = py(bv)
+        svg += f'<line x1="{PAD_L}" y1="{yv:.1f}" x2="{W-PAD_R}" y2="{yv:.1f}" stroke="#e2e8f0" stroke-width="1"/>'
+    # 塗り面
+    svg += f'<polygon points="{fill_pts}" fill="{fill_color}" opacity="0.5"/>'
+    # 折れ線
+    svg += f'<polyline points="{pts}" fill="none" stroke="{line_color}" stroke-width="2.5" stroke-linejoin="round"/>'
+    # ドット＋ラベル（8レースごと or 全件が少ない場合は全件）
+    step = max(1, len(balances) // 10)
+    for i, (b, lbl) in enumerate(zip(balances, labels)):
+        cx, cy = px(i), py(b)
+        dc = "#38a169" if (i == 0 or history[i-1][2] >= 0) else "#e53e3e"
+        svg += f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="3.5" fill="{dc}" stroke="white" stroke-width="1"/>'
+        if i % step == 0 or i == len(balances) - 1:
+            svg += f'<text x="{cx:.1f}" y="{H-PAD_B+14}" text-anchor="middle" font-size="9" fill="#718096">{lbl}</text>'
+    # Y軸ラベル
+    svg += f'<text x="{PAD_L-5}" y="{y0+4:.1f}" text-anchor="end" font-size="10" fill="#718096">0</text>'
+    if max_b != 0:
+        svg += f'<text x="{PAD_L-5}" y="{py(max_b)+4:.1f}" text-anchor="end" font-size="10" fill="#38a169">+{max_b:,}</text>'
+    if min_b != 0:
+        svg += f'<text x="{PAD_L-5}" y="{py(min_b)+4:.1f}" text-anchor="end" font-size="10" fill="#e53e3e">{min_b:,}</text>'
+    svg += '</svg>'
+    return svg
 
 def simulate_race(boats, n=5000):
     if not boats: return {}
@@ -210,10 +285,12 @@ def dashboard(request):
                 hit = "HIT" if int(result[0].get("boat","")) == best else "MISS"
             except:
                 pass
+        payout = _cache_get(f"payout_{stadium['code']}_{hd}_{rno}")
         return {
             "stadium": stadium["name"], "stadium_code": stadium["code"],
             "rno": rno, "boats": boats, "sim": sim, "best": best,
-            "best_rate": best_rate, "ev": ev, "result": result, "hit": hit
+            "best_rate": best_rate, "ev": ev, "result": result, "hit": hit,
+            "payout": payout,
         }
 
     raw_results = {}
@@ -234,6 +311,26 @@ def dashboard(request):
     miss_count = sum(1 for r in all_races if r["hit"]=="MISS")
     acc = round(hit_count/(hit_count+miss_count)*100,1) if (hit_count+miss_count)>0 else 0
 
+    # --- 収支シミュレーション ---
+    BET = 300
+    sim_balance = 0
+    sim_history = []  # [(ラベル, 累計収支)]
+    total_invested = 0
+    for rc in all_races:
+        if rc["hit"] not in ("HIT", "MISS"):
+            continue
+        label = f"{rc['stadium']}R{rc['rno']}"
+        total_invested += BET
+        if rc["hit"] == "HIT":
+            payout = rc.get("payout") or 350  # 取得できなければ3.5倍をデフォルト
+            gain = payout * (BET // 100) - BET
+        else:
+            gain = -BET
+        sim_balance += gain
+        sim_history.append((label, sim_balance, gain))
+    sim_roi = round(sim_balance / total_invested * 100, 1) if total_invested > 0 else 0
+    sim_chart = _make_balance_chart(sim_history)
+
     race_htmls = []
     for rc in all_races:
         conf = "HIGH" if rc["best_rate"]>35 else "MEDIUM" if rc["best_rate"]>25 else "LOW"
@@ -248,12 +345,17 @@ def dashboard(request):
             top3 = " → ".join([f'{r["rank"]}着:{r["name"]}' for r in rc["result"][:3]])
             result_html = f'<div class="result-box"><span class="result-label">結果:</span> {top3}</div>'
         hit_html = ""
+        bet_html = ""
         if rc["hit"]=="HIT":
             hit_html = '<span class="badge hit">🎯 的中!</span>'
+            payout = rc.get("payout") or 350
+            gain = payout * (BET // 100) - BET
+            bet_html = f'<span class="bet-gain">+{gain:,}円</span>'
         elif rc["hit"]=="MISS":
             hit_html = '<span class="badge miss">✗ 不的中</span>'
+            bet_html = f'<span class="bet-loss">-{BET:,}円</span>'
         race_htmls.append(f'''<div class="race-item"><div style="flex:1">
-<div class="race-name">{rc["stadium"]} R{rc["rno"]} <span class="badge {conf.lower()}">{conf}</span> {hit_html}</div>
+<div class="race-name">{rc["stadium"]} R{rc["rno"]} <span class="badge {conf.lower()}">{conf}</span> {hit_html} {bet_html}</div>
 <div class="race-detail">{names}</div>
 <div class="race-detail">推奨艇: {rc["best"]}番 ｜ 期待値: {rc["ev"]} ｜ {rec}</div>
 <div style="margin-top:6px;max-width:350px">{bars}</div>
@@ -302,6 +404,11 @@ body{{font-family:-apple-system,sans-serif;background:linear-gradient(135deg,#66
 .bg-status{{display:inline-flex;align-items:center;gap:6px;font-size:.78em;color:#555;margin-top:6px}}
 .bg-dot{{width:8px;height:8px;border-radius:50%;background:#48bb78;animation:pulse 2s infinite}}
 .bg-dot.inactive{{background:#cbd5e0;animation:none}}
+.bet-gain{{color:#22543d;background:#c6f6d5;padding:2px 7px;border-radius:8px;font-weight:bold;font-size:.78em;margin-left:4px}}
+.bet-loss{{color:#742a2a;background:#fed7d7;padding:2px 7px;border-radius:8px;font-weight:bold;font-size:.78em;margin-left:4px}}
+.sim-balance{{font-size:2.4em;font-weight:bold;margin:8px 0}}
+.sim-balance.pos{{color:#22543d}}.sim-balance.neg{{color:#c53030}}
+.chart-wrap{{margin-top:12px;overflow-x:auto}}
 .footer{{text-align:center;color:white;padding:15px;font-size:.8em}}
 </style></head><body>
 <div class="container">
@@ -317,6 +424,18 @@ body{{font-family:-apple-system,sans-serif;background:linear-gradient(135deg,#66
 <div class="sc o"><h3>💰 推奨BUY</h3><div class="v">{buy_count}</div></div>
 <div class="sc g"><h3>🎯 的中数</h3><div class="v">{hit_count}</div></div>
 <div class="sc r"><h3>📊 的中率</h3><div class="v">{acc}%</div></div>
+</div>
+<div class="section">
+<h2>💴 収支シミュレーション（1レース {BET}円賭け・単勝）</h2>
+<div class="stats">
+<div class="sc{"" if sim_balance>=0 else " r"}"><h3>💰 累計収支</h3><div class="sim-balance {"pos" if sim_balance>=0 else "neg"}">{sim_balance:+,}円</div></div>
+<div class="sc"><h3>📥 総投資額</h3><div class="v">{total_invested:,}円</div></div>
+<div class="sc{"" if sim_roi>=0 else " r"}"><h3>📈 ROI</h3><div class="v {"pos" if sim_roi>=0 else "neg"}" style="font-size:1.5em">{sim_roi:+}%</div></div>
+<div class="sc g"><h3>🎯 的中数</h3><div class="v">{hit_count}回</div></div>
+<div class="sc r"><h3>✗ 外れ数</h3><div class="v">{miss_count}回</div></div>
+<div class="sc o"><h3>📊 的中率</h3><div class="v">{acc}%</div></div>
+</div>
+<div class="chart-wrap">{sim_chart}</div>
 </div>
 <div class="section">
 <h2>📋 レース予想 & 結果（実データ）</h2>
