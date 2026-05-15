@@ -25,12 +25,12 @@ def _cache_get(key):
 def _cache_set(key, val):
     _cache[key] = (val, time.time())
 
-def _force_refresh_all():
-    global _last_refresh_time
-    _cache.pop("race_date", None)
-    hd = find_race_date()
+def _fetch_and_save_date(hd):
+    """指定日の全レースを取得してDBに保存"""
     _cache.pop(f"stadiums_{hd}", None)
     stadiums = get_stadiums_for_date(hd)
+    if not stadiums:
+        return
     tasks = [(s, r) for s in stadiums[:6] for r in range(1, 13)]
     for s, r in tasks:
         _cache.pop(f"card_{s['code']}_{hd}_{r}", None)
@@ -42,7 +42,6 @@ def _force_refresh_all():
         futures += [executor.submit(get_before_info,  s["code"], hd, r) for s, r in tasks]
         for f in as_completed(futures):
             pass
-    # エージェント予想 & 学習を DB に保存
     try:
         from boat_race.agent import PredictionAgent
         agent = PredictionAgent()
@@ -66,15 +65,42 @@ def _force_refresh_all():
                 pass
     except Exception:
         pass
+
+def _backfill_missing_dates(days=7):
+    """過去N日間でDBにデータがない日を取得して補完"""
+    from boat_race.models import RacePrediction
+    today = date.today()
+    for i in range(1, days + 1):
+        ds = (today - timedelta(days=i)).strftime("%Y%m%d")
+        if RacePrediction.objects.filter(date=ds).count() > 5:
+            continue  # 十分なデータがあればスキップ
+        try:
+            _fetch_and_save_date(ds)
+        except Exception:
+            pass
+
+def _force_refresh_all():
+    global _last_refresh_time
+    _cache.pop("race_date", None)
+    hd = find_race_date()
+    _fetch_and_save_date(hd)
     _last_refresh_time = datetime.now(JST)
 
 def _background_worker():
     time.sleep(3)
+    loop_count = 0
     while True:
         try:
             _force_refresh_all()
         except Exception:
             pass
+        # 起動直後 (loop_count=0) と約24時間ごとに過去データを補完
+        if loop_count % 288 == 0:
+            try:
+                _backfill_missing_dates(days=7)
+            except Exception:
+                pass
+        loop_count += 1
         time.sleep(REFRESH_INTERVAL)
 
 def start_background_refresh():
