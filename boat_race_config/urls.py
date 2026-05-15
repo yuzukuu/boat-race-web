@@ -10,10 +10,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import re, random, time, threading
 
 _cache = {}
-CACHE_TTL = 300  # 5分
+CACHE_TTL = 300
 _last_refresh_time = None
 _bg_thread = None
-REFRESH_INTERVAL = 290  # TTLより少し短く設定し常に新鮮なキャッシュを維持
+REFRESH_INTERVAL = 290
+BET = 300
 
 def _cache_get(key):
     entry = _cache.get(key)
@@ -25,7 +26,6 @@ def _cache_set(key, val):
     _cache[key] = (val, time.time())
 
 def _force_refresh_all():
-    """キャッシュを無視して全データを再取得し直す"""
     global _last_refresh_time
     _cache.pop("race_date", None)
     hd = find_race_date()
@@ -37,15 +37,39 @@ def _force_refresh_all():
         _cache.pop(f"result_{s['code']}_{hd}_{r}", None)
         _cache.pop(f"before_{s['code']}_{hd}_{r}", None)
     with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = [executor.submit(get_race_card,    s["code"], hd, r) for s, r in tasks]
+        futures  = [executor.submit(get_race_card,   s["code"], hd, r) for s, r in tasks]
         futures += [executor.submit(get_race_result,  s["code"], hd, r) for s, r in tasks]
         futures += [executor.submit(get_before_info,  s["code"], hd, r) for s, r in tasks]
         for f in as_completed(futures):
             pass
+    # エージェント予想 & 学習を DB に保存
+    try:
+        from boat_race.agent import PredictionAgent
+        agent = PredictionAgent()
+        for s, rno in tasks:
+            jcd   = s["code"]
+            boats = _cache_get(f"card_{jcd}_{hd}_{rno}")
+            if not boats:
+                continue
+            result      = _cache_get(f"result_{jcd}_{hd}_{rno}")
+            before_info = _cache_get(f"before_{jcd}_{hd}_{rno}")
+            if result:
+                try:
+                    actual = int(result[0].get("boat", ""))
+                    payout = _cache_get(f"payout_{jcd}_{hd}_{rno}")
+                    agent.update_with_result(hd, jcd, rno, actual, payout)
+                except Exception:
+                    pass
+            try:
+                agent.predict(boats, hd, jcd, s["name"], rno, before_info)
+            except Exception:
+                pass
+    except Exception:
+        pass
     _last_refresh_time = datetime.now(JST)
 
 def _background_worker():
-    time.sleep(3)  # サーバー起動直後の余裕を持たせる
+    time.sleep(3)
     while True:
         try:
             _force_refresh_all()
@@ -142,10 +166,10 @@ def get_race_card(jcd, hd, rno):
             name_el = row.select_one(".is-fs18")
             name = name_el.get_text(strip=True) if name_el else f"選手{i}"
             nums = re.findall(r'\d+\.\d+', row.get_text())
-            win_rate   = nums[0] if len(nums) > 0 else "3.00"   # 全国勝率
-            place_rate = nums[1] if len(nums) > 1 else "30.0"   # 全国2連対率
-            local_rate = nums[2] if len(nums) > 2 else win_rate  # 当地勝率
-            motor_rate = nums[4] if len(nums) > 4 else "30.0"   # モーター2連対率
+            win_rate   = nums[0] if len(nums) > 0 else "3.00"
+            place_rate = nums[1] if len(nums) > 1 else "30.0"
+            local_rate = nums[2] if len(nums) > 2 else win_rate
+            motor_rate = nums[4] if len(nums) > 4 else "30.0"
             boats.append({
                 "number": i, "name": name,
                 "win_rate": win_rate, "place_rate": place_rate,
@@ -175,7 +199,6 @@ def get_race_result(jcd, hd, rno):
                 boat_num = tds[1].get_text(strip=True)
                 name = tds[2].get_text(strip=True)
                 results.append({"rank": rank, "boat": boat_num, "name": name})
-        # 単勝払戻金をサイドエフェクトとしてキャッシュ
         payout_key = f"payout_{jcd}_{hd}_{rno}"
         if results and _cache_get(payout_key) is None:
             payout = _extract_tansho_payout(soup)
@@ -187,7 +210,6 @@ def get_race_result(jcd, hd, rno):
         return []
 
 def get_before_info(jcd, hd, rno):
-    """直前情報（展示ST・展示タイム・チルト・天候）を取得"""
     cache_key = f"before_{jcd}_{hd}_{rno}"
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -215,14 +237,13 @@ def get_before_info(jcd, hd, rno):
                 boats[num] = {'tilt': tilt, 'tenji_time': ttime, 'tenji_st': st}
             except Exception:
                 continue
-        # 天候・風速・波高・水温
         weather = {}
         text = soup.get_text()
         for pattern, key in [
             (r'天候[：:\s]+([^\s\n　]+)', 'tenki'),
-            (r'風速[：:\s]+(\d+)',             'wind_speed'),
-            (r'波高[：:\s]+(\d+)',             'wave'),
-            (r'水温[：:\s]+(\d+\.?\d*)',       'water_temp'),
+            (r'風速[：:\s]+(\d+)',         'wind_speed'),
+            (r'波高[：:\s]+(\d+)',         'wave'),
+            (r'水温[：:\s]+(\d+\.?\d*)',   'water_temp'),
         ]:
             m = re.search(pattern, text)
             if m:
@@ -234,7 +255,6 @@ def get_before_info(jcd, hd, rno):
         return {'boats': {}, 'weather': {}}
 
 def _extract_tansho_payout(soup):
-    """結果ページのHTMLから単勝払戻金（円/100円）を抽出する"""
     try:
         for row in soup.select("tr"):
             cells = row.select("td,th")
@@ -251,14 +271,13 @@ def _extract_tansho_payout(soup):
     return None
 
 def _make_balance_chart(history):
-    """収支推移SVGチャートを生成する。history: [(label, balance, gain), ...]"""
     if not history:
-        return '<p style="color:#999;text-align:center;padding:20px">結果が出たレースがありません</p>'
-    W, H, PAD_L, PAD_R, PAD_T, PAD_B = 700, 220, 55, 20, 20, 40
+        return '<p style="color:#bbb;text-align:center;padding:24px;font-size:.85em">表示できるデータがありません</p>'
+    W, H, PAD_L, PAD_R, PAD_T, PAD_B = 700, 200, 55, 20, 18, 38
     iW = W - PAD_L - PAD_R
     iH = H - PAD_T - PAD_B
     balances = [0] + [b for _, b, _ in history]
-    labels = ["開始"] + [l for l, _, _ in history]
+    labels   = ["開始"] + [l for l, _, _ in history]
     min_b = min(min(balances), 0)
     max_b = max(max(balances), 0)
     rng = max_b - min_b or 1
@@ -271,29 +290,24 @@ def _make_balance_chart(history):
     line_color = "#38a169" if final >= 0 else "#e53e3e"
     fill_color = "#c6f6d5" if final >= 0 else "#fed7d7"
 
-    pts = " ".join(f"{px(i):.1f},{py(b):.1f}" for i, b in enumerate(balances))
+    pts      = " ".join(f"{px(i):.1f},{py(b):.1f}" for i, b in enumerate(balances))
     fill_pts = f"{px(0):.1f},{y0:.1f} {pts} {px(len(balances)-1):.1f},{y0:.1f}"
 
-    svg = f'<svg viewBox="0 0 {W} {H}" style="width:100%;min-width:400px;height:{H}px">'
-    # グリッド・ゼロライン
+    svg  = f'<svg viewBox="0 0 {W} {H}" style="width:100%;height:{H}px">'
     svg += f'<line x1="{PAD_L}" y1="{y0:.1f}" x2="{W-PAD_R}" y2="{y0:.1f}" stroke="#a0aec0" stroke-width="1.5" stroke-dasharray="5,3"/>'
     for bv in [min_b, max_b]:
         if bv == 0: continue
         yv = py(bv)
         svg += f'<line x1="{PAD_L}" y1="{yv:.1f}" x2="{W-PAD_R}" y2="{yv:.1f}" stroke="#e2e8f0" stroke-width="1"/>'
-    # 塗り面
-    svg += f'<polygon points="{fill_pts}" fill="{fill_color}" opacity="0.5"/>'
-    # 折れ線
+    svg += f'<polygon points="{fill_pts}" fill="{fill_color}" opacity="0.45"/>'
     svg += f'<polyline points="{pts}" fill="none" stroke="{line_color}" stroke-width="2.5" stroke-linejoin="round"/>'
-    # ドット＋ラベル（8レースごと or 全件が少ない場合は全件）
     step = max(1, len(balances) // 10)
     for i, (b, lbl) in enumerate(zip(balances, labels)):
         cx, cy = px(i), py(b)
         dc = "#38a169" if (i == 0 or history[i-1][2] >= 0) else "#e53e3e"
         svg += f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="3.5" fill="{dc}" stroke="white" stroke-width="1"/>'
         if i % step == 0 or i == len(balances) - 1:
-            svg += f'<text x="{cx:.1f}" y="{H-PAD_B+14}" text-anchor="middle" font-size="9" fill="#718096">{lbl}</text>'
-    # Y軸ラベル
+            svg += f'<text x="{cx:.1f}" y="{H-PAD_B+13}" text-anchor="middle" font-size="9" fill="#718096">{lbl}</text>'
     svg += f'<text x="{PAD_L-5}" y="{y0+4:.1f}" text-anchor="end" font-size="10" fill="#718096">0</text>'
     if max_b != 0:
         svg += f'<text x="{PAD_L-5}" y="{py(max_b)+4:.1f}" text-anchor="end" font-size="10" fill="#38a169">+{max_b:,}</text>'
@@ -316,253 +330,252 @@ def simulate_race(boats, n=5000):
     for r in results: counts[r] = counts.get(r, 0) + 1
     return {b["number"]: round(counts.get(i,0)/n*100, 1) for i, b in enumerate(boats)}
 
+_CSS_BASE = """
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;color:#1a1a2e;min-height:100vh}
+.wrap{max-width:860px;margin:0 auto;padding:16px}
+.hdr{background:linear-gradient(135deg,#4c51bf,#6b46c1);color:white;padding:16px 20px;border-radius:10px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center}
+.hdr h1{font-size:1.1em;font-weight:700}
+.hdr .meta{font-size:.78em;opacity:.85;text-align:right}
+.live{display:inline-block;width:8px;height:8px;border-radius:50%;background:#68d391;margin-right:4px;animation:blink 2s infinite;vertical-align:middle}
+.live.off{background:#fc8181;animation:none}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+.sc{background:white;padding:12px 10px;border-radius:8px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.sc .lbl{font-size:.68em;color:#888;margin-bottom:3px}
+.sc .v{font-size:1.5em;font-weight:700}
+.v.pos{color:#38a169}.v.neg{color:#e53e3e}
+.card{background:white;border-radius:10px;padding:16px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.card h2{font-size:.9em;color:#4c51bf;margin-bottom:12px;font-weight:600;padding-bottom:8px;border-bottom:1px solid #f0f0f0}
+table{width:100%;border-collapse:collapse}
+th{font-size:.72em;color:#999;padding:6px 8px;border-bottom:2px solid #f0f0f0;text-align:left;white-space:nowrap}
+td{padding:11px 8px;border-bottom:1px solid #f7f7f7;font-size:.87em}
+.row-link{cursor:pointer;transition:background .12s}
+.row-link:hover{background:#f8f8ff}
+.bal{font-weight:700}.bal.pos{color:#38a169}.bal.neg{color:#e53e3e}
+.t-today{background:#4c51bf;color:white;font-size:.62em;padding:1px 5px;border-radius:6px;margin-left:5px;vertical-align:middle}
+.empty{text-align:center;color:#aaa;padding:20px 0}
+.btn{display:inline-block;padding:9px 16px;border:none;border-radius:7px;cursor:pointer;font-size:.85em;font-weight:600;text-decoration:none;margin-right:8px}
+.btn-p{background:#4c51bf;color:white}.btn-p:hover{background:#434190}
+.btn-g{background:#edf2f7;color:#4a5568}.btn-g:hover{background:#e2e8f0}
+.footer{text-align:center;color:#bbb;font-size:.73em;padding:12px 0}
+@media(max-width:600px){.stats{grid-template-columns:repeat(2,1fr)}}
+"""
+
+def _get_daily_summaries():
+    from boat_race.models import RacePrediction
+    from collections import defaultdict
+    preds = RacePrediction.objects.filter(hit__isnull=False).order_by('date', 'race_no')
+    daily = defaultdict(lambda: {'hits': 0, 'total': 0, 'balance': 0})
+    for p in preds:
+        if p.hit and p.payout is None:
+            continue
+        d = daily[p.date]
+        d['total'] += 1
+        if p.hit:
+            gain = p.payout * (BET // 100) - BET
+            d['balance'] += gain
+            d['hits'] += 1
+        else:
+            d['balance'] -= BET
+    return dict(sorted(daily.items(), reverse=True))
+
+
 def dashboard(request):
     from boat_race.agent import PredictionAgent
-    hd = find_race_date()
-    hd_display = f"{hd[:4]}/{hd[4:6]}/{hd[6:]}"
-    stadiums = get_stadiums_for_date(hd)
-    now = datetime.now(JST).strftime("%H:%M:%S")
-    bg_status = f"最終バックグラウンド取得: {_last_refresh_time.strftime('%H:%M:%S')}" if _last_refresh_time else "バックグラウンド取得: 準備中..."
-    bg_active = _bg_thread is not None and _bg_thread.is_alive()
-    max_stadiums = min(len(stadiums), 6)
-    tasks = [(stadium, rno) for stadium in stadiums[:max_stadiums] for rno in range(1, 13)]
+    hd      = find_race_date()
+    hd_disp = f"{hd[:4]}/{hd[4:6]}/{hd[6:]}"
+    now     = datetime.now(JST).strftime("%H:%M")
+    bg_cls  = "live" if (_bg_thread and _bg_thread.is_alive()) else "live off"
+    bg_time = _last_refresh_time.strftime('%H:%M') if _last_refresh_time else '---'
 
-    def fetch_race(stadium, rno):
-        boats = get_race_card(stadium["code"], hd, rno)
-        if not boats:
-            return None
-        result      = get_race_result(stadium["code"], hd, rno)
-        before_info = get_before_info(stadium["code"], hd, rno)
-        sim = simulate_race(boats)
-        best = max(sim, key=sim.get) if sim else 1
-        best_rate = sim.get(best, 0)
-        ev = round((best_rate/100)*3.5-(1-best_rate/100), 2)
-        hit = ""
-        if result:
-            try:
-                hit = "HIT" if int(result[0].get("boat","")) == best else "MISS"
-            except:
-                pass
-        payout = _cache_get(f"payout_{stadium['code']}_{hd}_{rno}")
-        return {
-            "stadium": stadium["name"], "stadium_code": stadium["code"],
-            "rno": rno, "boats": boats, "sim": sim, "best": best,
-            "best_rate": best_rate, "ev": ev, "result": result, "hit": hit,
-            "payout": payout, "before_info": before_info,
-        }
-
-    raw_results = {}
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        future_map = {executor.submit(fetch_race, s, r): (s["code"], r) for s, r in tasks}
-        for future in as_completed(future_map):
-            key = future_map[future]
-            data = future.result()
-            if data:
-                raw_results[key] = data
-
-    all_races = [raw_results[k] for k in sorted(raw_results, key=lambda x: (x[0], x[1]))]
-
-    # --- エージェント予想 & 学習 ---
-    agent = PredictionAgent()
-    # 結果が出たレースの重みを先に更新
-    for rc in all_races:
-        if rc['hit'] in ('HIT', 'MISS') and rc['result']:
-            try:
-                actual = int(rc['result'][0].get('boat', '0'))
-                agent.update_with_result(hd, rc['stadium_code'], rc['rno'], actual, rc.get('payout'))
-            except Exception:
-                pass
-    # 全レースに対してエージェント予想を実行
-    for rc in all_races:
-        try:
-            ab, ac, ap = agent.predict(rc['boats'], hd, rc['stadium_code'], rc['stadium'], rc['rno'], rc.get('before_info'))
-            rc['agent_boat'] = ab
-            rc['agent_conf'] = ac
-            rc['agent_agree'] = (ab == rc['best'])
-        except Exception:
-            rc['agent_boat'] = rc['best']
-            rc['agent_conf'] = 0
-            rc['agent_agree'] = True
+    agent       = PredictionAgent()
     agent_stats = agent.get_stats(30)
-    w = agent.weights
+    w           = agent.weights
 
-    total_races = len(all_races)
-    high_count = sum(1 for r in all_races if r["best_rate"]>35)
-    buy_count = sum(1 for r in all_races if r["ev"]>0.1)
-    hit_count = sum(1 for r in all_races if r["hit"]=="HIT")
-    miss_count = sum(1 for r in all_races if r["hit"]=="MISS")
-    acc = round(hit_count/(hit_count+miss_count)*100,1) if (hit_count+miss_count)>0 else 0
+    daily      = _get_daily_summaries()
+    total_bal  = sum(d['balance'] for d in daily.values())
+    total_inv  = sum(d['total'] * BET for d in daily.values())
+    total_hits = sum(d['hits']   for d in daily.values())
+    total_rcs  = sum(d['total']  for d in daily.values())
+    roi        = round(total_bal / total_inv * 100, 1) if total_inv else 0
 
-    # --- 収支シミュレーション ---
-    BET = 300
-    sim_balance = 0
-    sim_history = []  # [(ラベル, 累計収支)]
-    total_invested = 0
-    for rc in all_races:
-        if rc["hit"] not in ("HIT", "MISS"):
-            continue
-        # 払戻金が取得できていないレースはシミュレーション対象外
-        if rc["hit"] == "HIT" and not rc.get("payout"):
-            continue
-        label = f"{rc['stadium']}R{rc['rno']}"
-        total_invested += BET
-        if rc["hit"] == "HIT":
-            gain = rc["payout"] * (BET // 100) - BET
-        else:
-            gain = -BET
-        sim_balance += gain
-        sim_history.append((label, sim_balance, gain))
-    sim_roi = round(sim_balance / total_invested * 100, 1) if total_invested > 0 else 0
-    sim_chart = _make_balance_chart(sim_history)
+    # 収支チャート（日別推移）
+    chart_pts = []
+    running = 0
+    for ds in sorted(daily.keys()):
+        running += daily[ds]['balance']
+        chart_pts.append((f"{ds[4:6]}/{ds[6:]}", running, daily[ds]['balance']))
+    chart_svg = _make_balance_chart(chart_pts)
 
-    race_htmls = []
-    for rc in all_races:
-        conf = "HIGH" if rc["best_rate"]>35 else "MEDIUM" if rc["best_rate"]>25 else "LOW"
-        rec = "BUY" if rc["ev"]>0.1 else "HOLD" if rc["ev"]>-0.1 else "SKIP"
-        bars = ""
-        for b in rc["boats"]:
-            rate = rc["sim"].get(b["number"],0)
-            bars += f'<div class="bc"><div class="bl">艇{b["number"]}</div><div class="br"><div class="bf" style="width:{rate}%"></div></div><div class="bv">{rate}%</div></div>'
-        names = " / ".join([b["name"] for b in rc["boats"]])
-        result_html = ""
-        if rc["result"]:
-            top3 = " → ".join([f'{r["rank"]}着:{r["name"]}' for r in rc["result"][:3]])
-            result_html = f'<div class="result-box"><span class="result-label">結果:</span> {top3}</div>'
-        hit_html = ""
-        bet_html = ""
-        if rc["hit"]=="HIT":
-            hit_html = '<span class="badge hit">🎯 的中!</span>'
-            if rc.get("payout"):
-                gain = rc["payout"] * (BET // 100) - BET
-                bet_html = f'<span class="bet-gain">+{gain:,}円</span>'
-        elif rc["hit"]=="MISS":
-            hit_html = '<span class="badge miss">✗ 不的中</span>'
-            bet_html = f'<span class="bet-loss">-{BET:,}円</span>'
-        agent_cls = "agent-agree" if rc["agent_agree"] else "agent-diff"
-        agent_html = (f'<span class="agent-badge {agent_cls}">'
-                      f'🤖 {rc["agent_boat"]}番 ({rc["agent_conf"]}%)</span>')
-        race_htmls.append(f'''<div class="race-item"><div style="flex:1">
-<div class="race-name">{rc["stadium"]} R{rc["rno"]} <span class="badge {conf.lower()}">{conf}</span> {hit_html} {bet_html}</div>
-<div class="race-detail">{names}</div>
-<div class="race-detail">モンテカルロ: {rc["best"]}番 ｜ {agent_html} ｜ 期待値: {rc["ev"]} ｜ {rec}</div>
-<div style="margin-top:6px;max-width:350px">{bars}</div>
-{result_html}
-</div></div>''')
+    bal_str = f"+{total_bal:,}" if total_bal >= 0 else f"{total_bal:,}"
+    bal_cls = "pos" if total_bal >= 0 else "neg"
+    roi_str = f"+{roi}" if roi >= 0 else str(roi)
+    roi_cls = "pos" if roi >= 0 else "neg"
 
-    if not race_htmls:
-        race_htmls.append('<p style="color:#999;text-align:center;padding:40px">レースデータが見つかりませんでした</p>')
+    rows = ""
+    for ds, d in daily.items():
+        disp     = f"{ds[:4]}/{ds[4:6]}/{ds[6:]}"
+        is_today = (ds == hd)
+        today_t  = '<span class="t-today">TODAY</span>' if is_today else ""
+        b_cls    = "bal pos" if d['balance'] >= 0 else "bal neg"
+        b_str    = f"+{d['balance']:,}" if d['balance'] >= 0 else f"{d['balance']:,}"
+        hit_pct  = round(d['hits'] / d['total'] * 100) if d['total'] else 0
+        rows    += (f'<tr class="row-link" onclick="location.href=\'/day/{ds}/\'">'
+                    f'<td>{disp}{today_t}</td>'
+                    f'<td style="text-align:right">{d["total"]}</td>'
+                    f'<td style="text-align:right">{d["hits"]} ({hit_pct}%)</td>'
+                    f'<td style="text-align:right" class="{b_cls}">{b_str}円</td></tr>')
+    if not rows:
+        rows = '<tr><td colspan="4" class="empty">バックグラウンドでデータ取得中...<br><small>起動直後は数秒お待ちください</small></td></tr>'
 
-    html = f"""<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>ボートレース予想ダッシュボード</title>
-<style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-body{{font-family:-apple-system,sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
-.container{{max-width:1200px;margin:0 auto;padding:20px}}
-.header{{background:white;padding:25px;border-radius:10px;text-align:center;margin-bottom:20px;box-shadow:0 4px 6px rgba(0,0,0,.1)}}
-.header h1{{color:#667eea;font-size:1.8em}}.header p{{color:#666;margin-top:6px}}
-.live{{display:inline-block;background:#e53e3e;color:white;padding:2px 8px;border-radius:8px;font-size:.7em;animation:pulse 2s infinite}}
-@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.5}}}}
-.stats{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}}
-.sc{{background:white;padding:15px;border-radius:10px;border-left:4px solid #667eea;box-shadow:0 2px 4px rgba(0,0,0,.1)}}
-.sc h3{{color:#666;font-size:.75em;text-transform:uppercase;margin-bottom:5px}}
-.sc .v{{font-size:1.8em;font-weight:bold;color:#667eea}}
-.sc.g{{border-left-color:#48bb78}}.sc.g .v{{color:#48bb78}}
-.sc.o{{border-left-color:#f6ad55}}.sc.o .v{{color:#f6ad55}}
-.sc.r{{border-left-color:#e53e3e}}.sc.r .v{{color:#e53e3e}}
-.section{{background:white;padding:20px;border-radius:10px;margin-bottom:20px;box-shadow:0 2px 4px rgba(0,0,0,.1)}}
-.section h2{{color:#667eea;margin-bottom:12px;border-bottom:2px solid #667eea;padding-bottom:6px;font-size:1.2em}}
-.race-item{{border:1px solid #e2e8f0;padding:12px;margin-bottom:8px;border-radius:8px}}
-.race-item:hover{{border-color:#667eea;box-shadow:0 2px 8px rgba(102,126,234,.15)}}
-.race-name{{font-weight:bold;font-size:1em;margin-bottom:4px}}
-.race-detail{{color:#666;font-size:.8em;margin-top:2px}}
-.badge{{padding:3px 8px;border-radius:10px;font-weight:bold;font-size:.75em;margin-left:5px}}
-.badge.high{{background:#c6f6d5;color:#22543d}}.badge.medium{{background:#feebc8;color:#7c2d12}}.badge.low{{background:#e2e8f0;color:#2d3748}}
-.badge.hit{{background:#c6f6d5;color:#22543d}}.badge.miss{{background:#fed7d7;color:#742a2a}}
-.bc{{display:flex;align-items:center;margin:2px 0}}.bl{{width:30px;font-size:.75em;color:#666}}
-.br{{height:8px;background:#e2e8f0;border-radius:4px;flex:1;margin:0 5px;overflow:hidden}}
-.bf{{height:100%;background:linear-gradient(90deg,#667eea,#764ba2);border-radius:4px}}
-.bv{{width:38px;text-align:right;font-size:.75em;font-weight:bold;color:#667eea}}
-.result-box{{margin-top:8px;padding:6px 10px;background:#f7fafc;border-radius:6px;border-left:3px solid #667eea;font-size:.8em;color:#333}}
-.result-label{{font-weight:bold;color:#667eea}}
-.btn{{padding:8px 16px;border:none;border-radius:5px;cursor:pointer;font-weight:bold;margin-right:6px;font-size:.85em}}
-.btn-p{{background:#667eea;color:white}}.btn-p:hover{{background:#764ba2}}
-.btn-s{{background:#e2e8f0;color:#333}}
-.bg-status{{display:inline-flex;align-items:center;gap:6px;font-size:.78em;color:#555;margin-top:6px}}
-.bg-dot{{width:8px;height:8px;border-radius:50%;background:#48bb78;animation:pulse 2s infinite}}
-.bg-dot.inactive{{background:#cbd5e0;animation:none}}
-.bet-gain{{color:#22543d;background:#c6f6d5;padding:2px 7px;border-radius:8px;font-weight:bold;font-size:.78em;margin-left:4px}}
-.bet-loss{{color:#742a2a;background:#fed7d7;padding:2px 7px;border-radius:8px;font-weight:bold;font-size:.78em;margin-left:4px}}
-.agent-badge{{padding:2px 8px;border-radius:8px;font-size:.78em;font-weight:bold;margin-left:4px}}
-.agent-agree{{background:#ebf8ff;color:#2b6cb0}}
-.agent-diff{{background:#fef3c7;color:#92400e}}
-.wbar-wrap{{display:flex;gap:8px;margin-top:10px;align-items:center}}
-.wbar-label{{font-size:.78em;color:#555;width:90px;text-align:right}}
-.wbar-track{{height:14px;background:#e2e8f0;border-radius:7px;flex:1;overflow:hidden}}
-.wbar-fill{{height:100%;border-radius:7px;background:linear-gradient(90deg,#667eea,#764ba2)}}
-.wbar-val{{font-size:.78em;font-weight:bold;color:#667eea;width:38px}}
-.sim-balance{{font-size:2.4em;font-weight:bold;margin:8px 0}}
-.sim-balance.pos{{color:#22543d}}.sim-balance.neg{{color:#c53030}}
-.chart-wrap{{margin-top:12px;overflow-x:auto}}
-.footer{{text-align:center;color:white;padding:15px;font-size:.8em}}
-</style></head><body>
-<div class="container">
-<div class="header">
-<h1>🏆 ボートレース予想ダッシュボード <span class="live">LIVE</span></h1>
-<p>📅 {hd_display} ｜ 表示時刻: {now} ｜ データソース: boatrace.jp</p>
-<div class="bg-status"><span class="bg-dot{"" if bg_active else " inactive"}"></span>{bg_status}</div>
+    html = f"""<!DOCTYPE html><html lang="ja"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ボートレース予想</title>
+<style>{_CSS_BASE}</style></head><body>
+<div class="wrap">
+<div class="hdr">
+  <div>
+    <h1>🏆 ボートレース予想</h1>
+    <div style="font-size:.75em;margin-top:4px;opacity:.8">📅 {hd_disp} &nbsp;|&nbsp; {now}</div>
+  </div>
+  <div class="meta">
+    <span class="{bg_cls}"></span>バックグラウンド<br>最終取得: {bg_time}
+  </div>
 </div>
 <div class="stats">
-<div class="sc"><h3>🏁 取得レース</h3><div class="v">{total_races}</div></div>
-<div class="sc"><h3>📍 開催場数</h3><div class="v">{len(stadiums)}</div></div>
-<div class="sc g"><h3>⭐ 高信頼度</h3><div class="v">{high_count}</div></div>
-<div class="sc o"><h3>💰 推奨BUY</h3><div class="v">{buy_count}</div></div>
-<div class="sc g"><h3>🎯 的中数</h3><div class="v">{hit_count}</div></div>
-<div class="sc r"><h3>📊 的中率</h3><div class="v">{acc}%</div></div>
+  <div class="sc"><div class="lbl">累計収支</div><div class="v {bal_cls}">{bal_str}円</div></div>
+  <div class="sc"><div class="lbl">ROI</div><div class="v {roi_cls}">{roi_str}%</div></div>
+  <div class="sc"><div class="lbl">的中率（直近30）</div><div class="v">{agent_stats['hit_rate']}%</div></div>
+  <div class="sc"><div class="lbl">学習済みレース</div><div class="v">{w.race_count}</div></div>
 </div>
-<div class="section">
-<h2>🤖 エージェント学習状況</h2>
-<div class="stats">
-<div class="sc"><h3>🎓 学習済みレース</h3><div class="v">{w.race_count}</div></div>
-<div class="sc g"><h3>🎯 的中率（直近30件）</h3><div class="v">{agent_stats["hit_rate"]}%</div></div>
-<div class="sc o"><h3>✅ 的中数</h3><div class="v">{agent_stats["hits"]} / {agent_stats["count"]}</div></div>
+<div class="card">
+  <h2>収支推移</h2>
+  {chart_svg}
 </div>
-<div style="margin-top:14px">
-<div style="font-size:.85em;font-weight:bold;color:#667eea;margin-bottom:6px">現在の学習重み</div>
-<div class="wbar-wrap"><div class="wbar-label">🚤 コース有利</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_course*100:.0f}%"></div></div><div class="wbar-val">{w.w_course*100:.0f}%</div></div>
-<div class="wbar-wrap"><div class="wbar-label">👤 全国勝率</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_player_rate*100:.0f}%"></div></div><div class="wbar-val">{w.w_player_rate*100:.0f}%</div></div>
-<div class="wbar-wrap"><div class="wbar-label">🏟 当地勝率</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_local_rate*100:.0f}%"></div></div><div class="wbar-val">{w.w_local_rate*100:.0f}%</div></div>
-<div class="wbar-wrap"><div class="wbar-label">⚙️ モーター</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_motor_rate*100:.0f}%"></div></div><div class="wbar-val">{w.w_motor_rate*100:.0f}%</div></div>
-<div class="wbar-wrap"><div class="wbar-label">⏱ 展示タイム</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_tenji_time*100:.0f}%"></div></div><div class="wbar-val">{w.w_tenji_time*100:.0f}%</div></div>
-<div class="wbar-wrap"><div class="wbar-label">🚀 展示ST</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_tenji_st*100:.0f}%"></div></div><div class="wbar-val">{w.w_tenji_st*100:.0f}%</div></div>
+<div class="card">
+  <h2>日別収支 <small style="color:#aaa;font-weight:400">— クリックで詳細</small></h2>
+  <table>
+    <thead><tr>
+      <th>日付</th>
+      <th style="text-align:right">レース数</th>
+      <th style="text-align:right">的中</th>
+      <th style="text-align:right">収支</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
 </div>
+<div style="margin-bottom:16px">
+  <button class="btn btn-p" onclick="location.reload()">🔄 更新</button>
+  <a class="btn btn-p" href="/api/refresh/" onclick="this.textContent='取得中...';setTimeout(()=>location.reload(),5000);return false;">⚡ 今すぐ取得</a>
+  <a class="btn btn-g" href="/admin/">⚙️ 管理</a>
 </div>
-<div class="section">
-<h2>💴 収支シミュレーション（1レース {BET}円賭け・単勝）</h2>
-<div class="stats">
-<div class="sc{"" if sim_balance>=0 else " r"}"><h3>💰 累計収支</h3><div class="sim-balance {"pos" if sim_balance>=0 else "neg"}">{sim_balance:+,}円</div></div>
-<div class="sc"><h3>📥 総投資額</h3><div class="v">{total_invested:,}円</div></div>
-<div class="sc{"" if sim_roi>=0 else " r"}"><h3>📈 ROI</h3><div class="v {"pos" if sim_roi>=0 else "neg"}" style="font-size:1.5em">{sim_roi:+}%</div></div>
-<div class="sc g"><h3>🎯 的中数</h3><div class="v">{hit_count}回</div></div>
-<div class="sc r"><h3>✗ 外れ数</h3><div class="v">{miss_count}回</div></div>
-<div class="sc o"><h3>📊 的中率</h3><div class="v">{acc}%</div></div>
-</div>
-<div class="chart-wrap">{sim_chart}</div>
-</div>
-<div class="section">
-<h2>📋 レース予想 & 結果（実データ）</h2>
-{"".join(race_htmls)}
-</div>
-<div class="section">
-<h2>⚙️ 操作</h2>
-<button class="btn btn-p" onclick="location.reload()">🔄 表示更新</button>
-<a href="/api/refresh/" class="btn btn-p" onclick="this.textContent='更新中...';setTimeout(()=>location.href='/',3000);return false;">⚡ 今すぐ取得</a>
-<a href="/admin/" class="btn btn-s">⚙️ 管理画面</a>
-<a href="/api/races/" class="btn btn-s">📊 API (JSON)</a>
-</div>
-<div class="footer">© 2026 ボートレース予想システム ｜ データソース: boatrace.jp</div>
+<div class="footer">データソース: boatrace.jp</div>
 </div></body></html>"""
     return HttpResponse(html)
+
+
+def day_detail(request, hd):
+    hd_disp = f"{hd[:4]}/{hd[4:6]}/{hd[6:]}"
+
+    from boat_race.models import RacePrediction
+    preds = list(RacePrediction.objects.filter(date=hd).order_by('stadium_code', 'race_no'))
+
+    done   = [p for p in preds if p.hit is not None]
+    hits   = [p for p in done if p.hit and p.payout]
+    misses = [p for p in done if not p.hit]
+    day_bal = sum(p.payout * (BET // 100) - BET for p in hits) - len(misses) * BET
+    hit_pct = round(len(hits) / len(done) * 100) if done else 0
+    bal_cls = "pos" if day_bal >= 0 else "neg"
+    bal_str = f"+{day_bal:,}" if day_bal >= 0 else f"{day_bal:,}"
+
+    # 日内収支チャート
+    chart_pts = []
+    running   = 0
+    rows = ""
+    for p in preds:
+        conf_pct = round(p.confidence * 100, 1) if p.confidence else 0
+        is_done  = p.hit is not None
+        if is_done:
+            actual_str = f"{p.actual_winner}番" if p.actual_winner else "?"
+            if p.hit and p.payout:
+                gain = p.payout * (BET // 100) - BET
+                running += gain
+                chart_pts.append((f"R{p.race_no}", running, gain))
+                hit_cell = '<span class="bh">HIT</span>'
+                bal_cell = f'<span class="pos fw">+{gain:,}円</span>'
+            elif not p.hit:
+                running -= BET
+                chart_pts.append((f"R{p.race_no}", running, -BET))
+                hit_cell = '<span class="bm">MISS</span>'
+                bal_cell = f'<span class="neg fw">-{BET:,}円</span>'
+            else:
+                hit_cell = '<span class="bh">HIT</span>'
+                bal_cell = '<span style="color:#aaa">払戻不明</span>'
+        else:
+            actual_str = "—"
+            hit_cell   = '<span class="bu">予定</span>'
+            bal_cell   = '—'
+
+        rows += (f'<tr><td>{p.stadium_name}</td><td>R{p.race_no}</td>'
+                 f'<td>{p.predicted_boat}番 <small style="color:#aaa">({conf_pct}%)</small></td>'
+                 f'<td>{actual_str}</td><td>{hit_cell}</td><td>{bal_cell}</td></tr>')
+
+    if not rows:
+        rows = '<tr><td colspan="6" class="empty">このレース日のデータがありません</td></tr>'
+
+    day_chart = _make_balance_chart(chart_pts)
+
+    extra_css = """
+.bh{background:#c6f6d5;color:#22543d;font-size:.75em;padding:2px 8px;border-radius:8px;font-weight:600}
+.bm{background:#fed7d7;color:#742a2a;font-size:.75em;padding:2px 8px;border-radius:8px;font-weight:600}
+.bu{background:#e2e8f0;color:#4a5568;font-size:.75em;padding:2px 8px;border-radius:8px;font-weight:600}
+.pos{color:#38a169}.neg{color:#e53e3e}.fw{font-weight:700}
+.stats3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:16px}
+@media(max-width:600px){td,th{font-size:.78em;padding:8px 5px}}
+"""
+
+    html = f"""<!DOCTYPE html><html lang="ja"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{hd_disp} の詳細 | ボートレース予想</title>
+<style>{_CSS_BASE}{extra_css}</style></head><body>
+<div class="wrap">
+<div class="hdr">
+  <div>
+    <div style="margin-bottom:8px">
+      <a href="/" style="color:white;opacity:.8;font-size:.82em;text-decoration:none">← 一覧に戻る</a>
+    </div>
+    <h1>📅 {hd_disp} のレース詳細</h1>
+  </div>
+</div>
+<div class="stats3">
+  <div class="sc"><div class="lbl">日別収支</div><div class="v {bal_cls}">{bal_str}円</div></div>
+  <div class="sc"><div class="lbl">終了レース</div><div class="v">{len(done)}</div></div>
+  <div class="sc"><div class="lbl">的中率</div><div class="v">{hit_pct}%</div></div>
+</div>
+<div class="card">
+  <h2>収支推移</h2>
+  {day_chart}
+</div>
+<div class="card">
+  <h2>レース一覧</h2>
+  <div style="overflow-x:auto">
+  <table>
+    <thead><tr>
+      <th>会場</th><th>R</th><th>予想艇</th><th>結果</th><th>判定</th><th>収支</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  </div>
+</div>
+<div style="margin-bottom:16px">
+  <a class="btn btn-p" href="/">← 一覧に戻る</a>
+  <button class="btn btn-g" onclick="location.reload()">🔄 更新</button>
+</div>
+<div class="footer">データソース: boatrace.jp</div>
+</div></body></html>"""
+    return HttpResponse(html)
+
 
 def api_races(request):
     hd = find_race_date()
@@ -572,10 +585,10 @@ def api_races(request):
         for rno in range(1, 13):
             boats = get_race_card(stadium["code"], hd, rno)
             if not boats: continue
-            sim = simulate_race(boats)
+            sim    = simulate_race(boats)
             result = get_race_result(stadium["code"], hd, rno)
-            all_data.append({"stadium":stadium["name"],"race":rno,"boats":boats,"sim":sim,"result":result})
-    return JsonResponse({"date":hd,"races":all_data})
+            all_data.append({"stadium": stadium["name"], "race": rno, "boats": boats, "sim": sim, "result": result})
+    return JsonResponse({"date": hd, "races": all_data})
 
 def api_refresh(request):
     threading.Thread(target=_force_refresh_all, daemon=True).start()
@@ -583,7 +596,8 @@ def api_refresh(request):
 
 urlpatterns = [
     path("admin/", admin.site.urls),
-    path("", dashboard, name="dashboard"),
-    path("api/races/", api_races, name="api_races"),
-    path("api/refresh/", api_refresh, name="api_refresh"),
+    path("",               dashboard,   name="dashboard"),
+    path("day/<str:hd>/",  day_detail,  name="day_detail"),
+    path("api/races/",     api_races,   name="api_races"),
+    path("api/refresh/",   api_refresh, name="api_refresh"),
 ]

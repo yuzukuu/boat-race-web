@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s *)",
+      "Bash(ps aux *)",
+      "Bash(lsof -i *)",
+      "Bash(venv/bin/python manage.py check*)",
+      "Bash(venv/bin/python manage.py showmigrations*)",
+      "Bash(venv/bin/python manage.py diffsettings*)"
+    ]
+  }
+}
