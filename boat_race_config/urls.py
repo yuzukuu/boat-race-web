@@ -141,7 +141,8 @@ def get_race_card(jcd, hd, rno):
             name = name_el.get_text(strip=True) if name_el else f"選手{i}"
             nums = re.findall(r'\d+\.\d+', row.get_text())
             win_rate = nums[0] if nums else "3.00"
-            boats.append({"number": i, "name": name, "win_rate": win_rate})
+            motor_rate = nums[4] if len(nums) > 4 else "30.0"
+            boats.append({"number": i, "name": name, "win_rate": win_rate, "motor_rate": motor_rate})
         _cache_set(cache_key, boats)
         return boats
     except:
@@ -261,6 +262,7 @@ def simulate_race(boats, n=5000):
     return {b["number"]: round(counts.get(i,0)/n*100, 1) for i, b in enumerate(boats)}
 
 def dashboard(request):
+    from boat_race.agent import PredictionAgent
     hd = find_race_date()
     hd_display = f"{hd[:4]}/{hd[4:6]}/{hd[6:]}"
     stadiums = get_stadiums_for_date(hd)
@@ -303,6 +305,30 @@ def dashboard(request):
                 raw_results[key] = data
 
     all_races = [raw_results[k] for k in sorted(raw_results, key=lambda x: (x[0], x[1]))]
+
+    # --- エージェント予想 & 学習 ---
+    agent = PredictionAgent()
+    # 結果が出たレースの重みを先に更新
+    for rc in all_races:
+        if rc['hit'] in ('HIT', 'MISS') and rc['result']:
+            try:
+                actual = int(rc['result'][0].get('boat', '0'))
+                agent.update_with_result(hd, rc['stadium_code'], rc['rno'], actual, rc.get('payout'))
+            except Exception:
+                pass
+    # 全レースに対してエージェント予想を実行
+    for rc in all_races:
+        try:
+            ab, ac, ap = agent.predict(rc['boats'], hd, rc['stadium_code'], rc['stadium'], rc['rno'])
+            rc['agent_boat'] = ab
+            rc['agent_conf'] = ac
+            rc['agent_agree'] = (ab == rc['best'])
+        except Exception:
+            rc['agent_boat'] = rc['best']
+            rc['agent_conf'] = 0
+            rc['agent_agree'] = True
+    agent_stats = agent.get_stats(30)
+    w = agent.weights
 
     total_races = len(all_races)
     high_count = sum(1 for r in all_races if r["best_rate"]>35)
@@ -356,10 +382,13 @@ def dashboard(request):
         elif rc["hit"]=="MISS":
             hit_html = '<span class="badge miss">✗ 不的中</span>'
             bet_html = f'<span class="bet-loss">-{BET:,}円</span>'
+        agent_cls = "agent-agree" if rc["agent_agree"] else "agent-diff"
+        agent_html = (f'<span class="agent-badge {agent_cls}">'
+                      f'🤖 {rc["agent_boat"]}番 ({rc["agent_conf"]}%)</span>')
         race_htmls.append(f'''<div class="race-item"><div style="flex:1">
 <div class="race-name">{rc["stadium"]} R{rc["rno"]} <span class="badge {conf.lower()}">{conf}</span> {hit_html} {bet_html}</div>
 <div class="race-detail">{names}</div>
-<div class="race-detail">推奨艇: {rc["best"]}番 ｜ 期待値: {rc["ev"]} ｜ {rec}</div>
+<div class="race-detail">モンテカルロ: {rc["best"]}番 ｜ {agent_html} ｜ 期待値: {rc["ev"]} ｜ {rec}</div>
 <div style="margin-top:6px;max-width:350px">{bars}</div>
 {result_html}
 </div></div>''')
@@ -408,6 +437,14 @@ body{{font-family:-apple-system,sans-serif;background:linear-gradient(135deg,#66
 .bg-dot.inactive{{background:#cbd5e0;animation:none}}
 .bet-gain{{color:#22543d;background:#c6f6d5;padding:2px 7px;border-radius:8px;font-weight:bold;font-size:.78em;margin-left:4px}}
 .bet-loss{{color:#742a2a;background:#fed7d7;padding:2px 7px;border-radius:8px;font-weight:bold;font-size:.78em;margin-left:4px}}
+.agent-badge{{padding:2px 8px;border-radius:8px;font-size:.78em;font-weight:bold;margin-left:4px}}
+.agent-agree{{background:#ebf8ff;color:#2b6cb0}}
+.agent-diff{{background:#fef3c7;color:#92400e}}
+.wbar-wrap{{display:flex;gap:8px;margin-top:10px;align-items:center}}
+.wbar-label{{font-size:.78em;color:#555;width:90px;text-align:right}}
+.wbar-track{{height:14px;background:#e2e8f0;border-radius:7px;flex:1;overflow:hidden}}
+.wbar-fill{{height:100%;border-radius:7px;background:linear-gradient(90deg,#667eea,#764ba2)}}
+.wbar-val{{font-size:.78em;font-weight:bold;color:#667eea;width:38px}}
 .sim-balance{{font-size:2.4em;font-weight:bold;margin:8px 0}}
 .sim-balance.pos{{color:#22543d}}.sim-balance.neg{{color:#c53030}}
 .chart-wrap{{margin-top:12px;overflow-x:auto}}
@@ -426,6 +463,20 @@ body{{font-family:-apple-system,sans-serif;background:linear-gradient(135deg,#66
 <div class="sc o"><h3>💰 推奨BUY</h3><div class="v">{buy_count}</div></div>
 <div class="sc g"><h3>🎯 的中数</h3><div class="v">{hit_count}</div></div>
 <div class="sc r"><h3>📊 的中率</h3><div class="v">{acc}%</div></div>
+</div>
+<div class="section">
+<h2>🤖 エージェント学習状況</h2>
+<div class="stats">
+<div class="sc"><h3>🎓 学習済みレース</h3><div class="v">{w.race_count}</div></div>
+<div class="sc g"><h3>🎯 的中率（直近30件）</h3><div class="v">{agent_stats["hit_rate"]}%</div></div>
+<div class="sc o"><h3>✅ 的中数</h3><div class="v">{agent_stats["hits"]} / {agent_stats["count"]}</div></div>
+</div>
+<div style="margin-top:14px">
+<div style="font-size:.85em;font-weight:bold;color:#667eea;margin-bottom:6px">現在の学習重み</div>
+<div class="wbar-wrap"><div class="wbar-label">🚤 コース有利</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_course*100:.0f}%"></div></div><div class="wbar-val">{w.w_course*100:.0f}%</div></div>
+<div class="wbar-wrap"><div class="wbar-label">👤 選手勝率</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_player_rate*100:.0f}%"></div></div><div class="wbar-val">{w.w_player_rate*100:.0f}%</div></div>
+<div class="wbar-wrap"><div class="wbar-label">⚙️ モーター</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_motor_rate*100:.0f}%"></div></div><div class="wbar-val">{w.w_motor_rate*100:.0f}%</div></div>
+</div>
 </div>
 <div class="section">
 <h2>💴 収支シミュレーション（1レース {BET}円賭け・単勝）</h2>
