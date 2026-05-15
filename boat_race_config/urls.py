@@ -35,9 +35,11 @@ def _force_refresh_all():
     for s, r in tasks:
         _cache.pop(f"card_{s['code']}_{hd}_{r}", None)
         _cache.pop(f"result_{s['code']}_{hd}_{r}", None)
+        _cache.pop(f"before_{s['code']}_{hd}_{r}", None)
     with ThreadPoolExecutor(max_workers=20) as executor:
-        futures = [executor.submit(get_race_card, s["code"], hd, r) for s, r in tasks]
-        futures += [executor.submit(get_race_result, s["code"], hd, r) for s, r in tasks]
+        futures = [executor.submit(get_race_card,    s["code"], hd, r) for s, r in tasks]
+        futures += [executor.submit(get_race_result,  s["code"], hd, r) for s, r in tasks]
+        futures += [executor.submit(get_before_info,  s["code"], hd, r) for s, r in tasks]
         for f in as_completed(futures):
             pass
     _last_refresh_time = datetime.now(JST)
@@ -140,9 +142,15 @@ def get_race_card(jcd, hd, rno):
             name_el = row.select_one(".is-fs18")
             name = name_el.get_text(strip=True) if name_el else f"選手{i}"
             nums = re.findall(r'\d+\.\d+', row.get_text())
-            win_rate = nums[0] if nums else "3.00"
-            motor_rate = nums[4] if len(nums) > 4 else "30.0"
-            boats.append({"number": i, "name": name, "win_rate": win_rate, "motor_rate": motor_rate})
+            win_rate   = nums[0] if len(nums) > 0 else "3.00"   # 全国勝率
+            place_rate = nums[1] if len(nums) > 1 else "30.0"   # 全国2連対率
+            local_rate = nums[2] if len(nums) > 2 else win_rate  # 当地勝率
+            motor_rate = nums[4] if len(nums) > 4 else "30.0"   # モーター2連対率
+            boats.append({
+                "number": i, "name": name,
+                "win_rate": win_rate, "place_rate": place_rate,
+                "local_rate": local_rate, "motor_rate": motor_rate,
+            })
         _cache_set(cache_key, boats)
         return boats
     except:
@@ -177,6 +185,53 @@ def get_race_result(jcd, hd, rno):
         return results
     except:
         return []
+
+def get_before_info(jcd, hd, rno):
+    """直前情報（展示ST・展示タイム・チルト・天候）を取得"""
+    cache_key = f"before_{jcd}_{hd}_{rno}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    url = f"{BASE}/beforeinfo?jcd={jcd}&hd={hd}&rno={rno}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        r.encoding = "utf-8"
+        soup = BeautifulSoup(r.text, "html.parser")
+        boats = {}
+        for row in soup.select("tbody tr"):
+            tds = row.select("td")
+            if len(tds) < 5:
+                continue
+            try:
+                num = int(re.sub(r'\D', '', tds[0].get_text(strip=True)))
+                if not (1 <= num <= 6):
+                    continue
+                tilt_text  = tds[2].get_text(strip=True)
+                ttime_text = tds[3].get_text(strip=True)
+                st_text    = tds[4].get_text(strip=True)
+                tilt  = float(tilt_text)  if re.match(r'-?\d+\.?\d*', tilt_text)  else 0.0
+                ttime = float(ttime_text) if re.match(r'\d+\.\d+',    ttime_text) else 7.0
+                st    = int(re.sub(r'\D', '', st_text)) if re.search(r'\d', st_text) else 15
+                boats[num] = {'tilt': tilt, 'tenji_time': ttime, 'tenji_st': st}
+            except Exception:
+                continue
+        # 天候・風速・波高・水温
+        weather = {}
+        text = soup.get_text()
+        for pattern, key in [
+            (r'天候[：:\s]+([^\s\n　]+)', 'tenki'),
+            (r'風速[：:\s]+(\d+)',             'wind_speed'),
+            (r'波高[：:\s]+(\d+)',             'wave'),
+            (r'水温[：:\s]+(\d+\.?\d*)',       'water_temp'),
+        ]:
+            m = re.search(pattern, text)
+            if m:
+                weather[key] = m.group(1)
+        result = {'boats': boats, 'weather': weather}
+        _cache_set(cache_key, result)
+        return result
+    except Exception:
+        return {'boats': {}, 'weather': {}}
 
 def _extract_tansho_payout(soup):
     """結果ページのHTMLから単勝払戻金（円/100円）を抽出する"""
@@ -276,7 +331,8 @@ def dashboard(request):
         boats = get_race_card(stadium["code"], hd, rno)
         if not boats:
             return None
-        result = get_race_result(stadium["code"], hd, rno)
+        result      = get_race_result(stadium["code"], hd, rno)
+        before_info = get_before_info(stadium["code"], hd, rno)
         sim = simulate_race(boats)
         best = max(sim, key=sim.get) if sim else 1
         best_rate = sim.get(best, 0)
@@ -292,7 +348,7 @@ def dashboard(request):
             "stadium": stadium["name"], "stadium_code": stadium["code"],
             "rno": rno, "boats": boats, "sim": sim, "best": best,
             "best_rate": best_rate, "ev": ev, "result": result, "hit": hit,
-            "payout": payout,
+            "payout": payout, "before_info": before_info,
         }
 
     raw_results = {}
@@ -319,7 +375,7 @@ def dashboard(request):
     # 全レースに対してエージェント予想を実行
     for rc in all_races:
         try:
-            ab, ac, ap = agent.predict(rc['boats'], hd, rc['stadium_code'], rc['stadium'], rc['rno'])
+            ab, ac, ap = agent.predict(rc['boats'], hd, rc['stadium_code'], rc['stadium'], rc['rno'], rc.get('before_info'))
             rc['agent_boat'] = ab
             rc['agent_conf'] = ac
             rc['agent_agree'] = (ab == rc['best'])
@@ -474,8 +530,11 @@ body{{font-family:-apple-system,sans-serif;background:linear-gradient(135deg,#66
 <div style="margin-top:14px">
 <div style="font-size:.85em;font-weight:bold;color:#667eea;margin-bottom:6px">現在の学習重み</div>
 <div class="wbar-wrap"><div class="wbar-label">🚤 コース有利</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_course*100:.0f}%"></div></div><div class="wbar-val">{w.w_course*100:.0f}%</div></div>
-<div class="wbar-wrap"><div class="wbar-label">👤 選手勝率</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_player_rate*100:.0f}%"></div></div><div class="wbar-val">{w.w_player_rate*100:.0f}%</div></div>
+<div class="wbar-wrap"><div class="wbar-label">👤 全国勝率</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_player_rate*100:.0f}%"></div></div><div class="wbar-val">{w.w_player_rate*100:.0f}%</div></div>
+<div class="wbar-wrap"><div class="wbar-label">🏟 当地勝率</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_local_rate*100:.0f}%"></div></div><div class="wbar-val">{w.w_local_rate*100:.0f}%</div></div>
 <div class="wbar-wrap"><div class="wbar-label">⚙️ モーター</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_motor_rate*100:.0f}%"></div></div><div class="wbar-val">{w.w_motor_rate*100:.0f}%</div></div>
+<div class="wbar-wrap"><div class="wbar-label">⏱ 展示タイム</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_tenji_time*100:.0f}%"></div></div><div class="wbar-val">{w.w_tenji_time*100:.0f}%</div></div>
+<div class="wbar-wrap"><div class="wbar-label">🚀 展示ST</div><div class="wbar-track"><div class="wbar-fill" style="width:{w.w_tenji_st*100:.0f}%"></div></div><div class="wbar-val">{w.w_tenji_st*100:.0f}%</div></div>
 </div>
 </div>
 <div class="section">

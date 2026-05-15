@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(export PATH=\"$HOME/.railway/bin:$PATH\")",
+      "Bash(railway logs *)",
+      "Bash(SECRET_KEY=test ALLOWED_HOSTS=localhost DEBUG=False venv/bin/python -c ' *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(railway up *)",
+      "Bash(venv/bin/python manage.py makemigrations)",
+      "Bash(venv/bin/python manage.py migrate)",
+      "Bash(venv/bin/python manage.py check)"
+    ]
+  }
+}
