@@ -45,22 +45,27 @@ def _fetch_and_save_date(hd):
     try:
         from boat_race.agent import PredictionAgent
         agent = PredictionAgent()
+        # Pass 1: 予測を先に作成（DBに存在させる）
         for s, rno in tasks:
             jcd   = s["code"]
             boats = _cache_get(f"card_{jcd}_{hd}_{rno}")
             if not boats:
                 continue
-            result      = _cache_get(f"result_{jcd}_{hd}_{rno}")
             before_info = _cache_get(f"before_{jcd}_{hd}_{rno}")
-            if result:
-                try:
-                    actual = int(result[0].get("boat", ""))
-                    payout = _cache_get(f"payout_{jcd}_{hd}_{rno}")
-                    agent.update_with_result(hd, jcd, rno, actual, payout)
-                except Exception:
-                    pass
             try:
                 agent.predict(boats, hd, jcd, s["name"], rno, before_info)
+            except Exception:
+                pass
+        # Pass 2: 結果を紐付け（hit=True/False を設定）
+        for s, rno in tasks:
+            jcd    = s["code"]
+            result = _cache_get(f"result_{jcd}_{hd}_{rno}")
+            if not result:
+                continue
+            try:
+                actual = int(result[0].get("boat", ""))
+                payout = _cache_get(f"payout_{jcd}_{hd}_{rno}")
+                agent.update_with_result(hd, jcd, rno, actual, payout)
             except Exception:
                 pass
     except Exception:
@@ -458,6 +463,7 @@ def dashboard(request):
     html = f"""<!DOCTYPE html><html lang="ja"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ボートレース予想</title>
+<meta http-equiv="refresh" content="60">
 <style>{_CSS_BASE}</style></head><body>
 <div class="wrap">
 <div class="hdr">
