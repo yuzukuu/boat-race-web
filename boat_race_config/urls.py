@@ -71,18 +71,46 @@ def _fetch_and_save_date(hd):
     except Exception:
         pass
 
+def _update_results_for_date(hd):
+    """actual_winner が未設定の予測に対して結果を再取得して設定する"""
+    from boat_race.models import RacePrediction
+    from boat_race.agent import PredictionAgent
+    pending = list(RacePrediction.objects.filter(date=hd, actual_winner__isnull=True))
+    if not pending:
+        return
+    agent = PredictionAgent()
+    for pred in pending:
+        # キャッシュをクリアして再取得
+        _cache.pop(f"result_{pred.stadium_code}_{hd}_{pred.race_no}", None)
+        result = get_race_result(pred.stadium_code, hd, pred.race_no)
+        if not result:
+            continue
+        try:
+            actual = int(result[0].get("boat", ""))
+            payout = _cache_get(f"payout_{pred.stadium_code}_{hd}_{pred.race_no}")
+            agent.update_with_result(hd, pred.stadium_code, pred.race_no, actual, payout)
+        except Exception:
+            pass
+
 def _backfill_missing_dates(days=7):
-    """過去N日間でDBにデータがない日を取得して補完"""
+    """過去N日間でDBにデータがない/不完全な日を補完"""
     from boat_race.models import RacePrediction
     today = date.today()
     for i in range(1, days + 1):
         ds = (today - timedelta(days=i)).strftime("%Y%m%d")
-        if RacePrediction.objects.filter(date=ds).count() > 5:
-            continue  # 十分なデータがあればスキップ
-        try:
-            _fetch_and_save_date(ds)
-        except Exception:
-            pass
+        count = RacePrediction.objects.filter(date=ds).count()
+        if count == 0:
+            # 予測が全くない → フル取得
+            try:
+                _fetch_and_save_date(ds)
+            except Exception:
+                pass
+        else:
+            # 予測はあるが actual_winner 未設定のものがある → 結果だけ再取得
+            try:
+                _update_results_for_date(ds)
+            except Exception:
+                pass
 
 def _force_refresh_all():
     global _last_refresh_time
