@@ -211,6 +211,8 @@ def get_race_card(jcd, hd, rno):
     except:
         return []
 
+_KANJI_RANK = {'１': 1, '２': 2, '３': 3, '４': 4, '５': 5, '６': 6}
+
 def get_race_result(jcd, hd, rno):
     cache_key = f"result_{jcd}_{hd}_{rno}"
     cached = _cache_get(cache_key)
@@ -222,14 +224,32 @@ def get_race_result(jcd, hd, rno):
         r.encoding = "utf-8"
         soup = BeautifulSoup(r.text, "html.parser")
         results = []
-        rows = soup.select("tbody.is-fs14 tr, .is-w495 tbody tr")
-        for row in rows[:6]:
-            tds = row.select("td")
-            if len(tds) >= 3:
-                rank = tds[0].get_text(strip=True)
-                boat_num = tds[1].get_text(strip=True)
-                name = tds[2].get_text(strip=True)
-                results.append({"rank": rank, "boat": boat_num, "name": name})
+        # 着順・艇番が含まれる行を全 tbody から探す
+        for tbody in soup.find_all("tbody"):
+            for row in tbody.find_all("tr"):
+                tds = row.find_all("td")
+                if len(tds) < 3:
+                    continue
+                rank_text = tds[0].get_text(strip=True)
+                boat_text = tds[1].get_text(strip=True)
+                # 着順: 漢数字 or 算用数字 1〜6
+                rank_num = _KANJI_RANK.get(rank_text)
+                if rank_num is None:
+                    if rank_text.isdigit() and 1 <= int(rank_text) <= 6:
+                        rank_num = int(rank_text)
+                    else:
+                        continue
+                # 艇番: 1〜6
+                boat_digits = re.sub(r'\D', '', boat_text)
+                if not boat_digits or not (1 <= int(boat_digits) <= 6):
+                    continue
+                # 選手名: 先頭の登録番号（4桁）を除去
+                name_raw = tds[2].get_text(strip=True)
+                name = re.sub(r'^\d{4}\s*', '', name_raw).strip() or name_raw
+                results.append({"rank": str(rank_num), "boat": boat_digits, "name": name})
+        # 着順でソートして1〜6着に絞る
+        results.sort(key=lambda x: int(x["rank"]))
+        results = results[:6]
         payout_key = f"payout_{jcd}_{hd}_{rno}"
         if results and _cache_get(payout_key) is None:
             payout = _extract_tansho_payout(soup)
@@ -287,16 +307,25 @@ def get_before_info(jcd, hd, rno):
 
 def _extract_tansho_payout(soup):
     try:
-        for row in soup.select("tr"):
-            cells = row.select("td,th")
+        for row in soup.find_all("tr"):
+            cells = row.find_all(["td", "th"])
             texts = [c.get_text(strip=True) for c in cells]
-            if any("単勝" in t for t in texts):
-                for text in texts:
-                    nums = re.findall(r'[\d,]+', text)
-                    for n in nums:
-                        val = int(n.replace(',', ''))
-                        if 100 <= val <= 99900:
-                            return val
+            if not any("単勝" in t for t in texts):
+                continue
+            # 単勝行: ['単勝', '艇番', '¥380', ...]
+            for text in texts:
+                # ¥記号を除去して数値抽出
+                clean = text.replace('¥', '').replace(',', '').strip()
+                if clean.isdigit():
+                    val = int(clean)
+                    if 100 <= val <= 99900:
+                        return val
+            # フォールバック: テキスト全体から単勝の後ろの数値
+            combined = " ".join(texts)
+            for m in re.finditer(r'¥?([\d,]+)', combined):
+                val = int(m.group(1).replace(',', ''))
+                if 100 <= val <= 99900:
+                    return val
     except:
         pass
     return None
