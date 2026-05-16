@@ -40,20 +40,22 @@ def _fetch_and_save_date(hd):
         futures  = [executor.submit(get_race_card,   s["code"], hd, r) for s, r in tasks]
         futures += [executor.submit(get_race_result,  s["code"], hd, r) for s, r in tasks]
         futures += [executor.submit(get_before_info,  s["code"], hd, r) for s, r in tasks]
+        futures += [executor.submit(get_race_odds,    s["code"], hd, r) for s, r in tasks]
         for f in as_completed(futures):
             pass
     try:
         from boat_race.agent import PredictionAgent
         agent = PredictionAgent()
-        # Pass 1: 予測を先に作成（DBに存在させる）
+        # Pass 1: 予測を先に作成（オッズ込みでKelly判断）
         for s, rno in tasks:
             jcd   = s["code"]
             boats = _cache_get(f"card_{jcd}_{hd}_{rno}")
             if not boats:
                 continue
             before_info = _cache_get(f"before_{jcd}_{hd}_{rno}")
+            odds        = _cache_get(f"odds_{jcd}_{hd}_{rno}") or {}
             try:
-                agent.predict(boats, hd, jcd, s["name"], rno, before_info)
+                agent.predict(boats, hd, jcd, s["name"], rno, before_info, odds)
             except Exception:
                 pass
         # Pass 2: 結果を紐付け（hit=True/False を設定）
@@ -333,6 +335,49 @@ def get_before_info(jcd, hd, rno):
     except Exception:
         return {'boats': {}, 'weather': {}}
 
+def get_race_odds(jcd, hd, rno):
+    """単勝オッズを取得: {boat_num: payout_per_100}
+    例: {1: 250, 2: 480, 3: 820, ...}
+    レース前のみ有効。結果確定後・未開催日は空辞書を返す。
+    """
+    cache_key = f"odds_{jcd}_{hd}_{rno}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    url = f"{BASE}/oddstf?jcd={jcd}&hd={hd}&rno={rno}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        r.encoding = "utf-8"
+        soup = BeautifulSoup(r.text, "html.parser")
+        odds = {}
+        for tbody in soup.find_all("tbody"):
+            for row in tbody.find_all("tr"):
+                tds = row.find_all("td")
+                if len(tds) < 2:
+                    continue
+                boat_digits = re.sub(r'\D', '', tds[0].get_text(strip=True))
+                if not boat_digits or not (1 <= int(boat_digits) <= 6):
+                    continue
+                for td in tds[1:]:
+                    text = td.get_text(strip=True).replace(',', '').replace('¥', '').strip()
+                    try:
+                        val = float(text)
+                        if 1.0 <= val < 100:       # 小数オッズ (例: 2.5倍)
+                            payout = int(val * 100)
+                        elif 100 <= val <= 99900:   # 払戻額形式 (例: 250円)
+                            payout = int(val)
+                        else:
+                            continue
+                        odds[int(boat_digits)] = payout
+                        break
+                    except Exception:
+                        pass
+        if odds:
+            _cache_set(cache_key, odds)
+        return odds
+    except Exception:
+        return {}
+
 def _extract_tansho_payout(soup):
     try:
         for row in soup.find_all("tr"):
@@ -454,18 +499,22 @@ def _get_daily_summaries():
     from boat_race.models import RacePrediction
     from collections import defaultdict
     preds = RacePrediction.objects.filter(hit__isnull=False).order_by('date', 'race_no')
-    daily = defaultdict(lambda: {'hits': 0, 'total': 0, 'balance': 0})
+    daily = defaultdict(lambda: {'hits': 0, 'total': 0, 'balance': 0, 'skipped': 0})
     for p in preds:
+        bet = p.bet_amount
+        if bet == 0:
+            daily[p.date]['skipped'] += 1
+            continue
         if p.hit and p.payout is None:
             continue
         d = daily[p.date]
         d['total'] += 1
         if p.hit:
-            gain = p.payout * (BET // 100) - BET
+            gain = p.payout * (bet // 100) - bet
             d['balance'] += gain
             d['hits'] += 1
         else:
-            d['balance'] -= BET
+            d['balance'] -= bet
     return dict(sorted(daily.items(), reverse=True))
 
 
@@ -570,13 +619,15 @@ def day_detail(request, hd):
     from boat_race.models import RacePrediction
     preds = list(RacePrediction.objects.filter(date=hd).order_by('stadium_code', 'race_no'))
 
-    done   = [p for p in preds if p.hit is not None]
-    hits   = [p for p in done if p.hit and p.payout]
-    misses = [p for p in done if not p.hit]
-    day_bal = sum(p.payout * (BET // 100) - BET for p in hits) - len(misses) * BET
-    hit_pct = round(len(hits) / len(done) * 100) if done else 0
+    betted = [p for p in preds if p.hit is not None and p.bet_amount > 0]
+    hits   = [p for p in betted if p.hit and p.payout]
+    misses = [p for p in betted if not p.hit]
+    day_bal = (sum(p.payout * (p.bet_amount // 100) - p.bet_amount for p in hits)
+               - sum(p.bet_amount for p in misses))
+    hit_pct = round(len(hits) / len(betted) * 100) if betted else 0
     bal_cls = "pos" if day_bal >= 0 else "neg"
     bal_str = f"+{day_bal:,}" if day_bal >= 0 else f"{day_bal:,}"
+    skipped = sum(1 for p in preds if p.hit is not None and p.bet_amount == 0)
 
     # 日内収支チャート
     chart_pts = []
@@ -585,29 +636,39 @@ def day_detail(request, hd):
     for p in preds:
         conf_pct = round(p.confidence * 100, 1) if p.confidence else 0
         is_done  = p.hit is not None
+        bet      = p.bet_amount
+        ev_str   = f"{p.ev_at_bet:+.0f}" if p.ev_at_bet is not None else "—"
         if is_done:
             actual_str = f"{p.actual_winner}番" if p.actual_winner else "?"
-            if p.hit and p.payout:
-                gain = p.payout * (BET // 100) - BET
+            if bet == 0:
+                hit_cell = '<span class="bu">スキップ</span>'
+                bal_cell = '<span style="color:#aaa">EV≤0</span>'
+            elif p.hit and p.payout:
+                gain = p.payout * (bet // 100) - bet
                 running += gain
                 chart_pts.append((f"R{p.race_no}", running, gain))
                 hit_cell = '<span class="bh">HIT</span>'
                 bal_cell = f'<span class="pos fw">+{gain:,}円</span>'
             elif not p.hit:
-                running -= BET
-                chart_pts.append((f"R{p.race_no}", running, -BET))
+                running -= bet
+                chart_pts.append((f"R{p.race_no}", running, -bet))
                 hit_cell = '<span class="bm">MISS</span>'
-                bal_cell = f'<span class="neg fw">-{BET:,}円</span>'
+                bal_cell = f'<span class="neg fw">-{bet:,}円</span>'
             else:
                 hit_cell = '<span class="bh">HIT</span>'
                 bal_cell = '<span style="color:#aaa">払戻不明</span>'
         else:
             actual_str = "—"
-            hit_cell   = '<span class="bu">予定</span>'
-            bal_cell   = '—'
+            if bet == 0:
+                hit_cell = '<span class="bu">スキップ</span>'
+                bal_cell = '<span style="color:#aaa">EV≤0</span>'
+            else:
+                hit_cell = '<span class="bu">予定</span>'
+                bal_cell = f'<span style="color:#aaa">{bet}円</span>'
 
         rows += (f'<tr><td>{p.stadium_name}</td><td>R{p.race_no}</td>'
                  f'<td>{p.predicted_boat}番 <small style="color:#aaa">({conf_pct}%)</small></td>'
+                 f'<td style="color:#888;font-size:.8em">EV:{ev_str}</td>'
                  f'<td>{actual_str}</td><td>{hit_cell}</td><td>{bal_cell}</td></tr>')
 
     if not rows:
@@ -639,7 +700,7 @@ def day_detail(request, hd):
 </div>
 <div class="stats3">
   <div class="sc"><div class="lbl">日別収支</div><div class="v {bal_cls}">{bal_str}円</div></div>
-  <div class="sc"><div class="lbl">終了レース</div><div class="v">{len(done)}</div></div>
+  <div class="sc"><div class="lbl">ベット/スキップ</div><div class="v">{len(betted)}<small style="color:#aaa;font-size:.6em"> / {skipped}skip</small></div></div>
   <div class="sc"><div class="lbl">的中率</div><div class="v">{hit_pct}%</div></div>
 </div>
 <div class="card">
@@ -651,7 +712,7 @@ def day_detail(request, hd):
   <div style="overflow-x:auto">
   <table>
     <thead><tr>
-      <th>会場</th><th>R</th><th>予想艇</th><th>結果</th><th>判定</th><th>収支</th>
+      <th>会場</th><th>R</th><th>予想艇</th><th>EV</th><th>結果</th><th>判定</th><th>収支</th>
     </tr></thead>
     <tbody>{rows}</tbody>
   </table>

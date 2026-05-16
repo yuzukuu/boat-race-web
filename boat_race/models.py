@@ -46,6 +46,11 @@ class RacePrediction(models.Model):
     w_tenji_time  = models.FloatField(default=0.13)
     w_tenji_st    = models.FloatField(default=0.15)
 
+    # Kelly基準ベット判断
+    bet_amount = models.IntegerField(default=300)          # 実際に賭ける金額（0=スキップ）
+    bet_odds   = models.IntegerField(null=True, blank=True) # 賭け時の単勝オッズ（100円当たり払戻）
+    ev_at_bet  = models.FloatField(null=True, blank=True)   # 賭け時の期待値（100円当たり）
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
