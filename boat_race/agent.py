@@ -130,8 +130,11 @@ class PredictionAgent:
 
         conf = round(probs[best] * 100, 1)
 
-        w = self.weights
-        RacePrediction.objects.update_or_create(
+        w            = self.weights
+        bet_odds_val = odds.get(bet_boat) if bet_boat and odds else None
+        ev_rounded   = round(ev_val, 2) if ev_val is not None else None
+
+        obj, created = RacePrediction.objects.get_or_create(
             date=hd, stadium_code=stadium_code, race_no=race_no,
             defaults={
                 'stadium_name':   stadium_name,
@@ -146,10 +149,22 @@ class PredictionAgent:
                 'w_tenji_time':   w.w_tenji_time,
                 'w_tenji_st':     w.w_tenji_st,
                 'bet_amount':     bet_amount,
-                'bet_odds':       odds.get(bet_boat) if bet_boat and odds else None,
-                'ev_at_bet':      round(ev_val, 2) if ev_val is not None else None,
+                'bet_odds':       bet_odds_val,
+                'ev_at_bet':      ev_rounded,
             }
         )
+
+        if not created and obj.bet_odds is None and bet_odds_val is not None:
+            # 初回作成時はオッズ未取得だったが今回初めてオッズが得られた場合のみ更新
+            obj.predicted_boat = best
+            obj.confidence     = probs[best]
+            obj.bet_amount     = bet_amount
+            obj.bet_odds       = bet_odds_val
+            obj.ev_at_bet      = ev_rounded
+            obj.save(update_fields=[
+                'predicted_boat', 'confidence', 'bet_amount', 'bet_odds', 'ev_at_bet'
+            ])
+
         return best, conf, probs
 
     def update_with_result(self, hd, stadium_code, race_no, actual_winner, payout=None):
