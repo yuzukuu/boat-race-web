@@ -720,7 +720,266 @@ def day_detail(request, hd):
 </div>
 <div style="margin-bottom:16px">
   <a class="btn btn-p" href="/">← 一覧に戻る</a>
+  <a class="btn btn-p" href="/day/{hd}/report/" style="background:#6b46c1">📊 分析レポート</a>
   <button class="btn btn-g" onclick="location.reload()">🔄 更新</button>
+</div>
+<div class="footer">データソース: boatrace.jp</div>
+</div></body></html>"""
+    return HttpResponse(html)
+
+
+def day_report(request, hd):
+    import json as _json
+    from boat_race.models import RacePrediction, AgentWeight
+
+    hd_disp = f"{hd[:4]}/{hd[4:6]}/{hd[6:]}"
+    preds = list(RacePrediction.objects.filter(date=hd).order_by('stadium_code', 'race_no'))
+
+    if not preds:
+        html = f"""<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>分析レポート {hd_disp}</title>
+<style>{_CSS_BASE}</style></head><body>
+<div class="wrap">
+<div class="hdr"><div>
+  <div style="margin-bottom:8px"><a href="/day/{hd}/" style="color:white;opacity:.8;font-size:.82em;text-decoration:none">← 詳細に戻る</a></div>
+  <h1>📊 {hd_disp} 分析レポート</h1>
+</div></div>
+<div class="card"><p class="empty">このレース日のデータがありません</p></div>
+</div></body></html>"""
+        return HttpResponse(html)
+
+    done    = [p for p in preds if p.hit is not None]
+    betted  = [p for p in done  if p.bet_amount > 0]
+    skipped = [p for p in done  if p.bet_amount == 0]
+    hits    = [p for p in betted if p.hit and p.payout]
+    misses  = [p for p in betted if not p.hit]
+
+    day_bal  = (sum(p.payout * (p.bet_amount // 100) - p.bet_amount for p in hits)
+                - sum(p.bet_amount for p in misses))
+    hit_rate = len(hits) / len(betted) if betted else 0
+
+    # --- EV帯別分析 ---
+    ev_groups = [
+        ('高 EV≥+50',  lambda p: p.ev_at_bet is not None and p.ev_at_bet >= 50),
+        ('中 0≤EV<50', lambda p: p.ev_at_bet is not None and 0 <= p.ev_at_bet < 50),
+        ('低 EV<0',    lambda p: p.ev_at_bet is not None and p.ev_at_bet < 0),
+        ('EV不明',     lambda p: p.ev_at_bet is None),
+    ]
+    ev_rows = ""
+    for gname, gfn in ev_groups:
+        g = [p for p in betted if gfn(p)]
+        if not g:
+            continue
+        g_hits = [p for p in g if p.hit and p.payout]
+        g_bal  = (sum(p.payout * (p.bet_amount // 100) - p.bet_amount for p in g_hits)
+                  - sum(p.bet_amount for p in g if not p.hit))
+        g_hr   = round(len(g_hits) / len(g) * 100)
+        bs     = f"+{g_bal:,}" if g_bal >= 0 else f"{g_bal:,}"
+        bc     = "pos" if g_bal >= 0 else "neg"
+        avg_ev = round(sum(p.ev_at_bet for p in g if p.ev_at_bet is not None) / len(g), 1) if g else 0
+        ev_rows += (f'<tr><td>{gname}</td>'
+                    f'<td style="text-align:center">{avg_ev:+.1f}</td>'
+                    f'<td style="text-align:center">{len(g)}</td>'
+                    f'<td style="text-align:center">{len(g_hits)}/{len(g)} ({g_hr}%)</td>'
+                    f'<td style="text-align:right" class="{bc}">{bs}円</td></tr>')
+
+    # --- スキップ反実仮想 ---
+    skip_hits_l = [p for p in skipped if p.hit and p.payout]
+    skip_miss_l = [p for p in skipped if not p.hit]
+    skip_hyp    = (sum(p.payout * 3 - 300 for p in skip_hits_l)
+                   - 300 * len(skip_miss_l))
+    skip_hr     = round(len(skip_hits_l) / len(skipped) * 100) if skipped else 0
+    skip_hyp_s  = f"+{skip_hyp:,}" if skip_hyp >= 0 else f"{skip_hyp:,}"
+    skip_hyp_c  = "pos" if skip_hyp >= 0 else "neg"
+
+    # --- 艇番分布 ---
+    pred_dist   = {i: 0 for i in range(1, 7)}
+    actual_dist = {i: 0 for i in range(1, 7)}
+    for p in done:
+        pred_dist[p.predicted_boat] = pred_dist.get(p.predicted_boat, 0) + 1
+        if p.actual_winner:
+            actual_dist[p.actual_winner] = actual_dist.get(p.actual_winner, 0) + 1
+    total_done = max(len(done), 1)
+
+    # --- フィーチャー重み ---
+    w_label_map = [
+        ('コース位置', 'w_course'), ('全国勝率', 'w_player_rate'), ('当地勝率', 'w_local_rate'),
+        ('モーター',   'w_motor_rate'), ('展示タイム', 'w_tenji_time'), ('展示ST', 'w_tenji_st'),
+    ]
+    w_vals = {lbl: getattr(preds[0], attr) for lbl, attr in w_label_map}
+    wt     = AgentWeight.objects.order_by('-updated_at').first()
+
+    # --- フィーチャー重みSVG ---
+    def _weight_svg(wd):
+        items  = list(wd.items())
+        W, PL  = 460, 100
+        bh, gp = 22, 6
+        H      = 32 + len(items) * (bh + gp)
+        max_v  = max(v for _, v in items) or 1
+        s      = f'<svg viewBox="0 0 {W} {H}" style="width:100%;max-width:{W}px;font-family:sans-serif">'
+        for i, (lbl, val) in enumerate(items):
+            y  = 10 + i * (bh + gp)
+            bw = max(4, int(val / max_v * (W - PL - 65)))
+            c  = "#4c51bf" if val == max(wd.values()) else "#7c8dcc"
+            s += (f'<text x="{PL-6}" y="{y+bh//2+4}" text-anchor="end" font-size="12" fill="#444">{lbl}</text>'
+                  f'<rect x="{PL}" y="{y}" width="{bw}" height="{bh}" fill="{c}" rx="3" opacity=".85"/>'
+                  f'<text x="{PL+bw+6}" y="{y+bh//2+4}" font-size="12" fill="#333">{val:.1%}</text>')
+        s += '</svg>'
+        return s
+
+    # --- 艇番分布SVG ---
+    def _boat_svg(pd, ad, tot):
+        W, PL  = 460, 40
+        bh, gp = 16, 12
+        H      = 36 + 6 * (bh * 2 + 4 + gp)
+        max_v  = max(max(pd.values()), max(ad.values())) / tot or 1
+        s      = (f'<svg viewBox="0 0 {W} {H}" style="width:100%;max-width:{W}px;font-family:sans-serif">'
+                  f'<rect x="{PL}" y="6" width="12" height="10" fill="#4c51bf" rx="2"/>'
+                  f'<text x="{PL+16}" y="15" font-size="11" fill="#444">予想</text>'
+                  f'<rect x="{PL+60}" y="6" width="12" height="10" fill="#ed8936" rx="2"/>'
+                  f'<text x="{PL+76}" y="15" font-size="11" fill="#444">実際の1着</text>')
+        for i in range(1, 7):
+            y  = 26 + (i - 1) * (bh * 2 + 4 + gp)
+            pv = pd.get(i, 0) / tot
+            av = ad.get(i, 0) / tot
+            pw = max(2, int(pv / max_v * (W - PL - 70)))
+            aw = max(2, int(av / max_v * (W - PL - 70)))
+            s += (f'<text x="{PL-4}" y="{y+bh//2+4}" text-anchor="end" font-size="12" fill="#444">{i}号</text>'
+                  f'<rect x="{PL}" y="{y}" width="{pw}" height="{bh}" fill="#4c51bf" rx="2" opacity=".8"/>'
+                  f'<text x="{PL+pw+4}" y="{y+bh//2+4}" font-size="11" fill="#666">{pv:.0%}</text>'
+                  f'<rect x="{PL}" y="{y+bh+4}" width="{aw}" height="{bh}" fill="#ed8936" rx="2" opacity=".8"/>'
+                  f'<text x="{PL+aw+4}" y="{y+bh+4+bh//2+4}" font-size="11" fill="#666">{av:.0%}</text>')
+        s += '</svg>'
+        return s
+
+    weight_svg = _weight_svg(w_vals)
+    boat_svg   = _boat_svg(pred_dist, actual_dist, total_done)
+
+    # --- 改善提案 ---
+    suggestions = []
+
+    if betted:
+        if hit_rate < 0.15:
+            suggestions.append(('⚠️ EV閾値の引き上げを検討',
+                f'ベットレースの的中率 {hit_rate:.0%} が低水準です。EV≥+30〜+50 にフィルタを絞ることで無駄打ちを削減できます。'))
+        elif hit_rate >= 0.30:
+            suggestions.append(('✅ EV判断は機能しています',
+                f'ベットレースの的中率 {hit_rate:.0%} は良好です。現在のEV計算精度を維持してください。'))
+
+    if skipped and betted:
+        if len(skipped) > 0 and skip_hr > hit_rate * 100 * 1.3:
+            suggestions.append(('⚠️ スキップ過剰の可能性',
+                f'スキップレースの予想的中率 {skip_hr}% がベットレース {hit_rate:.0%} を上回っています。'
+                'オッズ取得のタイミングが遅くEV計算が保守的すぎる可能性があります。'))
+        if skip_hyp > day_bal:
+            suggestions.append(('💡 スキップより全賭けが有利な日',
+                f'全スキップレースに賭けた仮想収支 {skip_hyp_s}円 > 実際の収支。'
+                'オッズ取得精度の改善が収益向上につながる可能性があります。'))
+
+    top_pred = max(pred_dist, key=pred_dist.get)
+    top_ratio = pred_dist[top_pred] / total_done
+    if top_ratio > 0.45 and top_pred == 1:
+        suggestions.append(('⚠️ 1番艇への予想集中',
+            f'予想の {top_ratio:.0%} が1番艇に集中しています（コース重み: {w_vals.get("コース位置", 0):.1%}）。'
+            'コース位置の重みを下げると分散が改善します。'))
+
+    hi_odds = [p for p in betted if p.bet_odds and p.bet_odds > 500]
+    if hi_odds and not any(p.hit for p in hi_odds):
+        suggestions.append(('💡 高オッズレース (>500) の的中なし',
+            f'{len(hi_odds)}件の高オッズベットが全て外れています。高オッズレースへのベット比率を下げることを検討してください。'))
+
+    if wt and wt.race_count < 50:
+        suggestions.append(('📈 学習データが少ない段階',
+            f'学習済みレース数: {wt.race_count}件。精度向上には100件以上のデータ蓄積が必要です。'
+            'しばらくデータを蓄積し続けてください。'))
+
+    if not suggestions:
+        suggestions.append(('✅ 特記事項なし', 'このレース日では大きな問題は検出されませんでした。'))
+
+    sugg_html = "".join(
+        f'<div class="si"><div class="st">{t}</div><div class="sb">{b}</div></div>'
+        for t, b in suggestions
+    )
+
+    bal_str = f"+{day_bal:,}" if day_bal >= 0 else f"{day_bal:,}"
+    bal_cls = "pos" if day_bal >= 0 else "neg"
+
+    extra_css = """
+.si{padding:12px 14px;border-left:4px solid #4c51bf;margin-bottom:10px;background:#f8f9ff;border-radius:0 8px 8px 0}
+.st{font-weight:700;margin-bottom:4px;font-size:.9em}
+.sb{font-size:.82em;color:#555;line-height:1.5}
+.pos{color:#38a169}.neg{color:#e53e3e}
+.stats4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+@media(max-width:600px){.stats4{grid-template-columns:repeat(2,1fr)}}
+"""
+
+    html = f"""<!DOCTYPE html><html lang="ja"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{hd_disp} 分析レポート | ボートレース予想</title>
+<style>{_CSS_BASE}{extra_css}</style></head><body>
+<div class="wrap">
+<div class="hdr">
+  <div>
+    <div style="margin-bottom:8px">
+      <a href="/day/{hd}/" style="color:white;opacity:.8;font-size:.82em;text-decoration:none">← 詳細に戻る</a>
+    </div>
+    <h1>📊 {hd_disp} 分析レポート</h1>
+  </div>
+</div>
+<div class="stats4">
+  <div class="sc"><div class="lbl">収支</div><div class="v {bal_cls}">{bal_str}円</div></div>
+  <div class="sc"><div class="lbl">ベット</div><div class="v">{len(betted)}<small style="color:#aaa;font-size:.55em"> 件</small></div></div>
+  <div class="sc"><div class="lbl">スキップ</div><div class="v">{len(skipped)}<small style="color:#aaa;font-size:.55em"> 件</small></div></div>
+  <div class="sc"><div class="lbl">的中率</div><div class="v">{round(hit_rate*100)}%</div></div>
+</div>
+
+<div class="card">
+  <h2>EV帯別 ベット実績</h2>
+  <p style="font-size:.78em;color:#888;margin-bottom:10px">EV（期待値 = 確率×オッズ−100）の高さ別にベット結果を分析します。</p>
+  <div style="overflow-x:auto">
+  <table>
+    <thead><tr>
+      <th>EV帯</th><th style="text-align:center">平均EV</th>
+      <th style="text-align:center">件数</th><th style="text-align:center">的中</th>
+      <th style="text-align:right">収支</th>
+    </tr></thead>
+    <tbody>{ev_rows or '<tr><td colspan="5" class="empty">ベットデータなし</td></tr>'}</tbody>
+  </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>スキップレース 反実仮想分析</h2>
+  <p style="font-size:.78em;color:#888;margin-bottom:10px">EV≤0でスキップしたレースに仮に300円ずつ賭けていた場合の試算です。</p>
+  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:8px">
+    <div class="sc"><div class="lbl">スキップ数</div><div class="v">{len(skipped)}</div></div>
+    <div class="sc"><div class="lbl">仮想的中率</div><div class="v">{skip_hr}%</div></div>
+    <div class="sc"><div class="lbl">仮想収支</div><div class="v {skip_hyp_c}">{skip_hyp_s}円</div></div>
+  </div>
+  <p style="font-size:.78em;color:#999">※ 仮想収支は一律300円賭けた場合の試算。実際のオッズが異なる場合あり。</p>
+</div>
+
+<div class="card">
+  <h2>フィーチャー重み（この日の予想時点）</h2>
+  <p style="font-size:.78em;color:#888;margin-bottom:10px">各特徴量が予想スコアに占める割合。学習により毎回更新されます。</p>
+  {weight_svg}
+</div>
+
+<div class="card">
+  <h2>艇番分布（予想 vs 実際の1着）</h2>
+  <p style="font-size:.78em;color:#888;margin-bottom:10px">予想艇番の偏りと実際の1着分布を比較します。乖離が大きい艇番が改善余地です。</p>
+  {boat_svg}
+</div>
+
+<div class="card">
+  <h2>改善提案</h2>
+  {sugg_html}
+</div>
+
+<div style="margin-bottom:16px">
+  <a class="btn btn-p" href="/day/{hd}/">← 詳細に戻る</a>
+  <a class="btn btn-g" href="/">🏠 一覧</a>
 </div>
 <div class="footer">データソース: boatrace.jp</div>
 </div></body></html>"""
@@ -746,8 +1005,9 @@ def api_refresh(request):
 
 urlpatterns = [
     path("admin/", admin.site.urls),
-    path("",               dashboard,   name="dashboard"),
-    path("day/<str:hd>/",  day_detail,  name="day_detail"),
-    path("api/races/",     api_races,   name="api_races"),
-    path("api/refresh/",   api_refresh, name="api_refresh"),
+    path("",                      dashboard,   name="dashboard"),
+    path("day/<str:hd>/",         day_detail,  name="day_detail"),
+    path("day/<str:hd>/report/",  day_report,  name="day_report"),
+    path("api/races/",            api_races,   name="api_races"),
+    path("api/refresh/",          api_refresh, name="api_refresh"),
 ]
